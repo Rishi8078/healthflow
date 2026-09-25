@@ -71,7 +71,7 @@ does not connect directly to Apple Health.
 | `sleep_respiratory_rate` | Sleep respiratory rate | breaths/min | Enabled | Complete full-sleep reconciled summary; exposes standard deviation and signal-to-noise metadata |
 | `floors_today` | Floors today | floors | Enabled | All-source daily rollup; sum of reconciled current-day floor intervals until the rollup is published |
 | `sedentary_minutes_today` | Sedentary minutes today | min | Enabled | All-source daily rollup converted from duration; sum of reconciled current-day interval durations until the rollup is published |
-| `heart_rate_zone_minutes_today` | Heart rate zone minutes today | min | Enabled | Sum of available all-source heart-zone daily-rollup durations; reconciled current-day interval durations until the rollup is published |
+| `heart_rate_zone_minutes_today` | Heart rate zone minutes today | min | Enabled | Sum of moderate, vigorous and peak all-source heart-zone daily-rollup durations (light is only an attribute); reconciled current-day interval durations until the rollup is published |
 
 Expanded groups use no substitute metric when their required response shape is missing or
 invalid. A partial refresh preserves the prior normalized group; otherwise the entity is
@@ -134,7 +134,8 @@ not purge prior Home Assistant Recorder states or backups.
 
 After `include_paired_devices` is enabled and Google grants
 `https://www.googleapis.com/auth/googlehealth.settings.readonly`, Healthflow
-creates one Home Assistant service device for each returned tracker or scale.
+creates one Home Assistant device (manufacturer Google, model from
+`deviceVersion`) for each returned tracker or scale.
 It creates one battery and one last-sync entity per paired device:
 
 | Dynamic runtime key | Display meaning | Unit or class | Source |

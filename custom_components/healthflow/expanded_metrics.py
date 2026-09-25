@@ -220,6 +220,17 @@ def _active_zone_minutes(
                 return {}
             values[ACTIVE_ZONES[source_zone]] = float(value)
         return values
+    has_day_rollup = any(
+        (point := _mapping(value)) is not None
+        and (start := _civil_date_time(point.get("civilStartTime"))) is not None
+        and start[0].date() == day
+        for value in (_sequence(rollups.get("active-zone-minutes")) or ())
+    )
+    if not has_day_rollup and not _interval_payloads(
+        direct, "active-zone-minutes", "activeZoneMinutes", day
+    ):
+        # Google omits the daily point on days without zone minutes; that is a genuine zero.
+        return dict.fromkeys(ACTIVE_ZONES.values(), 0.0)
     return _sum_interval_values(
         direct,
         "active-zone-minutes",

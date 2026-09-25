@@ -88,7 +88,7 @@ def test_binary_entity_keys_are_stable() -> None:
     }
 
 
-def test_runtime_platforms_use_only_healthflow_as_manufacturer() -> None:
+def test_runtime_platforms_use_expected_manufacturers() -> None:
     for relative_path in (
         "custom_components/healthflow/sensor.py",
         "custom_components/healthflow/binary_sensor.py",
@@ -103,4 +103,4 @@ def test_runtime_platforms_use_only_healthflow_as_manufacturer() -> None:
             and isinstance(keyword.value, ast.Constant)
             and isinstance(keyword.value.value, str)
         ]
-        assert manufacturers and set(manufacturers) == {"Healthflow"}, relative_path
+        assert manufacturers and set(manufacturers) <= {"Healthflow", "Google"}, relative_path

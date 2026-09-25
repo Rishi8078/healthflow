@@ -83,13 +83,15 @@ def _expanded_mapping_value(field: str, key: str) -> ValueFunction:
     return value
 
 
-def _expanded_mapping_total(field: str) -> ValueFunction:
+def _expanded_mapping_total(field: str, exclude: tuple[str, ...] = ()) -> ValueFunction:
     def value(snapshot: CoordinatorSnapshot) -> SensorValue:
         summary = snapshot.current_day
         if summary is None:
             return None
         values = cast(Mapping[str, float], getattr(summary.expanded, field))
-        return sum(values.values()) if values else None
+        if not values:
+            return None
+        return sum(minutes for zone, minutes in values.items() if zone not in exclude)
 
     return value
 
@@ -505,7 +507,8 @@ SENSOR_DESCRIPTIONS: tuple[HealthSyncSensorEntityDescription, ...] = (
         device_class=SensorDeviceClass.DURATION,
         state_class=_DAILY_TOTALS,
         suggested_display_precision=1,
-        value_fn=_expanded_mapping_total("heart_zone_minutes"),
+        # LIGHT covers nearly all wear time, so it would drown out the exercise zones.
+        value_fn=_expanded_mapping_total("heart_zone_minutes", exclude=("light",)),
         attributes_fn=_expanded_mapping_attributes(
             "heart_zone_minutes",
             light_minutes="light",
@@ -836,10 +839,9 @@ class HealthSyncPairedDeviceSensor(CoordinatorEntity[HealthSyncCoordinator], Sen
         paired_identifier = f"{person_slug}_paired_{device.identity_digest}"
         self._attr_unique_id = f"{paired_identifier}_{description.key}"
         self._attr_device_info = DeviceInfo(
-            entry_type=DeviceEntryType.SERVICE,
             identifiers={(DOMAIN, paired_identifier)},
             name=f"{entry.title} {device.product_name}",
-            manufacturer="Healthflow",
+            manufacturer="Google",
             model=device.product_name,
             model_id=device.device_type,
         )

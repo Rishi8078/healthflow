@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from custom_components.healthflow.coordinator import _merge_partial_expanded
 from custom_components.healthflow.expanded_metrics import (
     normalize_expanded_day,
     normalize_hydration_ml,
@@ -711,6 +712,26 @@ def test_expanded_model_is_immutable_and_daily_summary_defaults_to_it() -> None:
     with pytest.raises(AttributeError):
         metrics.vo2_max = 42.5  # type: ignore[misc]
     assert DailySummary(date=DAY).expanded == ExpandedDailyMetrics()
+
+
+def test_day_without_active_zone_points_is_zero() -> None:
+    """Google omits the daily point on days without zone minutes."""
+    rollups = _rollups()
+    rollups["active-zone-minutes"] = []
+
+    result = normalize_expanded_day(DAY, {}, rollups, include_weight=False)
+
+    assert result.active_zone_minutes == {"fat_burn": 0.0, "cardio": 0.0, "peak": 0.0}
+
+
+def test_failed_active_zone_fetch_without_history_stays_unavailable() -> None:
+    """A failed request must not be reported as zero minutes."""
+    normalized = normalize_expanded_day(DAY, {}, {}, include_weight=False)
+
+    merged = _merge_partial_expanded(None, normalized, frozenset())
+
+    assert normalized.active_zone_minutes == {"fat_burn": 0.0, "cardio": 0.0, "peak": 0.0}
+    assert merged.active_zone_minutes == {}
 
 
 def test_explicit_zero_is_preserved_and_missing_groups_are_unavailable() -> None:

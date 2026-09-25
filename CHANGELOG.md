@@ -4,6 +4,17 @@ All notable public changes to Healthflow are recorded here.
 
 ## Unreleased
 
+### Fixed
+
+- Active zone minutes report 0 instead of unavailable on days without zone
+  minutes. Google omits the daily point for those days. A failed request still
+  leaves the sensor unavailable.
+- Heart rate zone minutes today now sums moderate, vigorous and peak only. The
+  light zone covers nearly all wear time and stays available as the
+  `light_minutes` attribute.
+- Paired devices show Google as manufacturer and are regular devices instead of
+  service devices.
+
 ### Added
 
 - Added `sleep_start` and `sleep_end` timestamp sensors for the latest valid

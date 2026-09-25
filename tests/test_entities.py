@@ -868,7 +868,7 @@ async def test_statistics_units_and_device_classes(
         ),
         (
             "heart_rate_zone_minutes_today",
-            "50.0",
+            "30.0",
             UnitOfTime.MINUTES,
             SensorDeviceClass.DURATION,
             SensorStateClass.TOTAL_INCREASING,
@@ -1204,10 +1204,10 @@ async def test_paired_device_entities_have_deterministic_private_identity_and_me
 
     device = dr.async_get(hass).async_get(battery_entry.device_id)
     assert device is not None
-    assert device.entry_type is dr.DeviceEntryType.SERVICE
+    assert device.entry_type is None
     assert device.identifiers == {(DOMAIN, "sample_alpha_paired_abc123")}
     assert device.name == "Sample Alpha Charge 6"
-    assert device.manufacturer == "Healthflow"
+    assert device.manufacturer == "Google"
     assert device.model == "Charge 6"
     assert device.model_id == "TRACKER"
 

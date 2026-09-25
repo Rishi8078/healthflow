@@ -1346,11 +1346,11 @@ def _merge_partial_expanded(
 ) -> ExpandedDailyMetrics:
     """Apply successful expanded groups while retaining failed prior groups."""
     values = {field.name: getattr(normalized, field.name) for field in fields(ExpandedDailyMetrics)}
-    if previous is not None:
-        for data_type, field_names in _EXPANDED_GROUP_FIELDS.items():
-            if data_type not in successful_types:
-                for field_name in field_names:
-                    values[field_name] = getattr(previous, field_name)
+    fallback = previous if previous is not None else ExpandedDailyMetrics()
+    for data_type, field_names in _EXPANDED_GROUP_FIELDS.items():
+        if data_type not in successful_types:
+            for field_name in field_names:
+                values[field_name] = getattr(fallback, field_name)
     return ExpandedDailyMetrics(**values)
 
 
