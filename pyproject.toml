@@ -12,7 +12,6 @@ dependencies = []
 [project.optional-dependencies]
 test = [
     "homeassistant==2026.7.2",
-    "Pillow==12.2.0",
     "pytest-homeassistant-custom-component==0.13.346",
     "ruff==0.15.21",
 ]

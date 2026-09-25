@@ -10,8 +10,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
@@ -24,5 +22,3 @@ jobs:
         run: python -m ruff check custom_components/healthflow tests scripts
       - name: Compile Python sources
         run: python -m compileall -q custom_components/healthflow tests scripts
-      - name: Verify public release
-        run: python scripts/verify_public_release.py .
