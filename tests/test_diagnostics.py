@@ -1,0 +1,933 @@
+"""Tests for redacted Healthflow diagnostics."""
+
+from datetime import UTC, date, datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from homeassistant.components.diagnostics import REDACTED
+
+from custom_components.healthflow.capabilities import (
+    CapabilityId,
+    validate_granted_scopes,
+)
+from custom_components.healthflow.const import (
+    BASE_SCOPES,
+    NUTRITION_SCOPE,
+    SETTINGS_SCOPE,
+)
+from custom_components.healthflow.diagnostics import (
+    _performance_diagnostics_record,
+    _redact_recursive,
+    _summarize_capabilities,
+    _summarize_day,
+    async_get_config_entry_diagnostics,
+)
+from custom_components.healthflow.models import (
+    CapabilityRefreshState,
+    CoordinatorSnapshot,
+    DailySummary,
+    ExpandedDailyMetrics,
+    PairedDeviceSummary,
+    SourceKind,
+    WorkoutSummary,
+)
+from custom_components.healthflow.performance import PerformanceRecord
+
+NOW = datetime(2042, 7, 13, 12, 0, tzinfo=UTC)
+FORBIDDEN = (
+    "secret",
+    "token",
+    "client-id",
+    "client_secret",
+    "google_user",
+    "dataPoints",
+    "samples",
+    "raw",
+    "authorization_code",
+    "users/me/pairedDevices/private-device-123",
+    "AA:BB:CC:DD:EE:FF",
+    "HEART_RATE",
+    "private-paired-digest",
+    "Private Tracker Model",
+    "Private breakfast",
+    "private-google-error",
+)
+
+
+def _summary() -> DailySummary:
+    return DailySummary(
+        date=date(2042, 7, 13),
+        steps=6200,
+        fitbit_steps=None,
+        distance_m=4812.5,
+        sleep_minutes=None,
+        total_energy_kcal=2410.5,
+        nutrition_energy_kcal=1830.0,
+        hydration_ml=2150.0,
+        sleep_period_minutes=402.0,
+        sleep_onset_minutes=6.0,
+        sleep_after_wake_minutes=12.0,
+        expanded=ExpandedDailyMetrics(
+            active_zone_minutes={"fat_burn": 12.0},
+            vo2_max=42.5,
+            vo2_estimated=False,
+            cardio_fitness_level="GOOD",
+            oxygen_average=96.2,
+            oxygen_lower_bound=95.1,
+            oxygen_upper_bound=97.3,
+            oxygen_standard_deviation=0.4,
+            daily_respiratory_rate=15.4,
+            sleep_respiratory_rates={"full": 14.8},
+            sleep_respiratory_standard_deviation=0.7,
+            sleep_respiratory_signal_to_noise=3.2,
+            floors=7,
+            sedentary_minutes=480.0,
+            heart_zone_minutes={"vigorous": 23.5},
+            heart_zone_thresholds={"vigorous": (133, 159)},
+            heart_zone_calories={"vigorous": 184.2},
+            weight_kg=80.5,
+            body_fat_percentage=21.4,
+            height_m=1.778,
+        ),
+        source=SourceKind.MIXED,
+        complete=False,
+        updated_at=NOW,
+    )
+
+
+def _performance_record(
+    *,
+    started_at: datetime = NOW,
+    duration_ms: int = 250,
+    google_request_count: int = 10,
+    google_request_duration_ms: int = 150,
+    storage_read_duration_ms: int = 15,
+    storage_write_duration_ms: int = 20,
+    queued_wait_duration_ms: int = 0,
+    outcome: str = "success",
+    slowest_phase: str = "google_requests",
+) -> PerformanceRecord:
+    """Create an allowlisted completed operation record for diagnostics tests."""
+    return PerformanceRecord(
+        operation="current_refresh",
+        started_at=started_at,
+        duration_ms=duration_ms,
+        google_request_count=google_request_count,
+        google_request_duration_ms=google_request_duration_ms,
+        storage_read_count=1,
+        storage_read_duration_ms=storage_read_duration_ms,
+        storage_write_count=1,
+        storage_write_duration_ms=storage_write_duration_ms,
+        queued_wait_duration_ms=queued_wait_duration_ms,
+        backfill_active=False,
+        enabled_capabilities=(CapabilityId.CORE_ACTIVITY,),
+        outcome=outcome,
+        slowest_phase=slowest_phase,
+        other_duration_ms=0,
+    )
+
+
+def _performance_entry(records: tuple[PerformanceRecord, ...]) -> MagicMock:
+    """Return a loaded entry with only the runtime dependencies diagnostics needs."""
+    entry = MagicMock()
+    entry.options = {}
+    entry.runtime_data.performance.snapshot.return_value = records
+    entry.runtime_data.history.async_query = AsyncMock(return_value=[])
+    entry.runtime_data.coordinator.data = CoordinatorSnapshot(
+        current_day=None,
+        backfill_complete=True,
+        expanded_backfill_complete=False,
+    )
+    entry.runtime_data.coordinator.data_types = ()
+    entry.runtime_data.coordinator.is_stale = False
+    entry.runtime_data.scope_grant = validate_granted_scopes(BASE_SCOPES, {})
+    return entry
+
+
+async def test_diagnostics_summarizes_bounded_performance_only_when_downloaded(hass) -> None:
+    """A downloaded report summarizes its immutable recorder snapshot with floor averages."""
+    records = (
+        _performance_record(),
+        _performance_record(
+            started_at=NOW + timedelta(minutes=15),
+            duration_ms=500,
+            google_request_count=14,
+            google_request_duration_ms=250,
+            storage_read_duration_ms=25,
+            storage_write_duration_ms=40,
+            queued_wait_duration_ms=10,
+            outcome="temporary_error",
+        ),
+    )
+    entry = _performance_entry(records)
+
+    result = await async_get_config_entry_diagnostics(hass, entry)
+
+    assert result["performance"] == {
+        "polling_interval_minutes": 15,
+        "record_limit": 12,
+        "record_count": 2,
+        "summary": {
+            "successful_operation_count": 1,
+            "failed_operation_count": 1,
+            # Averages use integer floor division to keep output deterministic.
+            "average_duration_ms": 375,
+            "maximum_duration_ms": 500,
+            "average_google_request_count": 12,
+            "maximum_google_request_count": 14,
+            "average_google_request_duration_ms": 200,
+            "maximum_google_request_duration_ms": 250,
+            "average_storage_read_duration_ms": 20,
+            "maximum_storage_read_duration_ms": 25,
+            "average_storage_write_duration_ms": 30,
+            "maximum_storage_write_duration_ms": 40,
+            "average_coordinator_wait_duration_ms": 5,
+            "maximum_coordinator_wait_duration_ms": 10,
+            "most_frequent_slowest_phase": "google_requests",
+            "core_backfill_complete": True,
+            "expanded_backfill_complete": False,
+        },
+        "recent_operations": [
+            records[0].to_diagnostics(),
+            records[1].to_diagnostics(),
+        ],
+    }
+    entry.runtime_data.performance.snapshot.assert_called_once_with()
+
+
+async def test_diagnostics_performance_empty_records_use_explicit_zero_and_nulls(hass) -> None:
+    """An entry with no completed measurements avoids implied performance values."""
+    entry = _performance_entry(())
+
+    result = await async_get_config_entry_diagnostics(hass, entry)
+
+    assert result["performance"] == {
+        "polling_interval_minutes": 15,
+        "record_limit": 12,
+        "record_count": 0,
+        "summary": {
+            "successful_operation_count": 0,
+            "failed_operation_count": 0,
+            "average_duration_ms": None,
+            "maximum_duration_ms": None,
+            "average_google_request_count": None,
+            "maximum_google_request_count": None,
+            "average_google_request_duration_ms": None,
+            "maximum_google_request_duration_ms": None,
+            "average_storage_read_duration_ms": None,
+            "maximum_storage_read_duration_ms": None,
+            "average_storage_write_duration_ms": None,
+            "maximum_storage_write_duration_ms": None,
+            "average_coordinator_wait_duration_ms": None,
+            "maximum_coordinator_wait_duration_ms": None,
+            "most_frequent_slowest_phase": None,
+            "core_backfill_complete": True,
+            "expanded_backfill_complete": False,
+        },
+        "recent_operations": [],
+    }
+
+
+async def test_diagnostics_performance_orders_by_start_time_with_stable_ties(hass) -> None:
+    """Download-time ordering is chronological and preserves equal-start input order."""
+    records = (
+        _performance_record(
+            started_at=NOW + timedelta(minutes=30),
+            duration_ms=300,
+            slowest_phase="storage_reads",
+        ),
+        _performance_record(
+            started_at=NOW,
+            duration_ms=100,
+            slowest_phase="google_requests",
+        ),
+        _performance_record(
+            started_at=NOW,
+            duration_ms=200,
+            slowest_phase="other",
+        ),
+    )
+    entry = _performance_entry(records)
+
+    result = await async_get_config_entry_diagnostics(hass, entry)
+
+    assert result["performance"]["summary"]["most_frequent_slowest_phase"] == (
+        "google_requests"
+    )
+    assert result["performance"]["recent_operations"] == [
+        records[1].to_diagnostics(),
+        records[2].to_diagnostics(),
+        records[0].to_diagnostics(),
+    ]
+
+
+async def test_diagnostics_performance_recursively_redacts_injected_snapshot_data(hass) -> None:
+    """Unsafe injected recorder scalars cannot bypass the final diagnostics gate."""
+    record = _performance_record()
+    entry = _performance_entry((record,))
+    entry.runtime_data.performance.snapshot.return_value = (
+        record,
+        MagicMock(
+            operation="current_refresh",
+            started_at=NOW + timedelta(minutes=15),
+            duration_ms=100,
+            google_request_count=1,
+            google_request_duration_ms=1,
+            storage_read_duration_ms=1,
+            storage_write_duration_ms=1,
+            queued_wait_duration_ms=1,
+            outcome="success",
+            slowest_phase="google_requests",
+            to_diagnostics=MagicMock(
+                return_value={
+                    "operation": "private-operation",
+                    "duration_ms": "private-health-value",
+                    "token": "secret-access-token",
+                    "nested": {"raw_payload": "private-google-error"},
+                }
+            ),
+        ),
+    )
+
+    result = await async_get_config_entry_diagnostics(hass, entry)
+
+    performance = result["performance"]
+    exposed = repr(performance)
+    for forbidden in FORBIDDEN:
+        assert forbidden not in exposed
+    assert performance["recent_operations"] == [record.to_diagnostics()]
+
+
+async def test_diagnostics_performance_filters_safe_shaped_additional_fields(hass) -> None:
+    """Safe-looking unknown fields cannot expand the approved operation schema."""
+    record = _performance_record()
+    injected = MagicMock(
+        started_at=record.started_at,
+        duration_ms=record.duration_ms,
+        google_request_count=record.google_request_count,
+        google_request_duration_ms=record.google_request_duration_ms,
+        storage_read_duration_ms=record.storage_read_duration_ms,
+        storage_write_duration_ms=record.storage_write_duration_ms,
+        queued_wait_duration_ms=record.queued_wait_duration_ms,
+        outcome=record.outcome,
+        slowest_phase=record.slowest_phase,
+        to_diagnostics=MagicMock(
+            return_value={
+                **record.to_diagnostics(),
+                "health_flag": True,
+                "metric_count": 12345,
+                "alternate_timestamp": NOW.isoformat(),
+                "other_duration_ms": 54321,
+            }
+        ),
+    )
+    entry = _performance_entry((injected,))
+
+    result = await async_get_config_entry_diagnostics(hass, entry)
+
+    assert result["performance"]["recent_operations"] == [record.to_diagnostics()]
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("operation", "private_operation"),
+        ("started_at", "2042-07-13T13:00:00+01:00"),
+        ("duration_ms", True),
+        ("google_request_count", -1),
+        ("google_request_duration_ms", 1.5),
+        ("storage_read_count", "1"),
+        ("storage_read_duration_ms", None),
+        ("storage_write_count", False),
+        ("storage_write_duration_ms", -1),
+        ("queued_wait_duration_ms", "1"),
+        ("backfill_active", 1),
+        ("enabled_capabilities", ["sleep", "core_activity"]),
+        ("enabled_capabilities", ["core_activity", "private_metric"]),
+        ("outcome", "private_outcome"),
+        ("slowest_phase", "private_phase"),
+    ],
+)
+def test_performance_record_schema_rejects_invalid_approved_fields(
+    field: str, invalid_value: object
+) -> None:
+    """A malformed approved field invalidates the complete operation record."""
+    payload = _performance_record().to_diagnostics()
+    payload[field] = invalid_value
+    injected = MagicMock(to_diagnostics=MagicMock(return_value=payload))
+
+    assert _performance_diagnostics_record(injected) is None
+
+
+async def test_diagnostics_exposes_health_and_redacts_recursive_secrets(hass) -> None:
+    entry = MagicMock()
+    entry.entry_id = "entry-id"
+    entry.title = "Sample Alpha"
+    entry.data = {
+        "person_name": "Sample Alpha",
+        "person_slug": "sample_alpha",
+        "client_id": "public-client-id",
+        "client" + "_secret": "top-secret-client-value",
+        "access" + "_token": "secret-access-token",
+        "refresh" + "_token": "secret-refresh-token",
+        "authorization_code": "secret-code",
+        "nested": {
+            "google_user_id": "google_user_123",
+            "raw_payload": {"dataPoints": [{"secret": "sample"}]},
+            "pairedDevices": [
+                {
+                    "name": "users/me/pairedDevices/private-device-123",
+                    "macAddress": "AA:BB:CC:DD:EE:FF",
+                    "features": ["HEART_RATE"],
+                }
+            ],
+        },
+    }
+    entry.options = {
+        "include_body_measurements": True,
+        "include_nutrition": True,
+        "include_paired_devices": True,
+    }
+    history = MagicMock()
+    history.async_query = AsyncMock(return_value=[_summary()])
+    history.backfill_cursor = date(2042, 7, 1)
+    coordinator = MagicMock()
+    coordinator.data = CoordinatorSnapshot(
+        current_day=_summary(),
+        last_success=NOW,
+        last_attempt=NOW,
+        authorization_healthy=True,
+        backfill_cursor=date(2042, 7, 1),
+        backfill_complete=False,
+        expanded_backfill_cursor=date(2042, 4, 14),
+        expanded_backfill_complete=True,
+        paired_devices=(
+            PairedDeviceSummary(
+                identity_digest="private-paired-digest",
+                device_type="TRACKER",
+                product_name="Private Tracker Model",
+                battery_status="High",
+                battery_percentage=84,
+                last_sync=NOW,
+            ),
+        ),
+        capability_states={
+            CapabilityId.NUTRITION: CapabilityRefreshState(
+                enabled=True,
+                scope_granted=True,
+                last_success=NOW,
+            ),
+            CapabilityId.PAIRED_DEVICES: CapabilityRefreshState(
+                enabled=True,
+                scope_granted=True,
+                last_success=NOW,
+                error_category="private-google-error",
+            ),
+        },
+    )
+    coordinator.data_types = ("steps", "sleep")
+    coordinator.is_stale = False
+    entry.runtime_data.history = history
+    entry.runtime_data.coordinator = coordinator
+    entry.runtime_data.scope_grant = validate_granted_scopes(
+        (*BASE_SCOPES, NUTRITION_SCOPE, SETTINGS_SCOPE),
+        entry.options,
+    )
+
+    result = await async_get_config_entry_diagnostics(hass, entry)
+
+    assert result["entry"] == {"loaded": True}
+    assert result["coordinator"]["authorization_healthy"] is True
+    assert result["coordinator"]["stale"] is False
+    assert result["coordinator"]["supported_data_type_count"] == 2
+    assert result["current_day"]["source"] == "mixed"
+    assert result["current_day"]["metric_availability"]["steps"] is True
+    assert result["current_day"]["metric_availability"]["sleep_minutes"] is False
+    assert result["current_day"]["metric_availability"]["total_energy_kcal"] is True
+    assert result["current_day"]["metric_availability"]["nutrition_energy_kcal"] is True
+    assert result["current_day"]["metric_availability"]["hydration_ml"] is True
+    assert result["current_day"]["metric_availability"]["sleep_period_minutes"] is True
+    assert result["current_day"]["metric_availability"]["sleep_onset_minutes"] is True
+    assert result["current_day"]["metric_availability"]["sleep_after_wake_minutes"] is True
+    assert result["current_day"]["expanded_metric_availability"] == {
+        "active_zone_minutes": True,
+        "vo2_max": True,
+        "vo2_estimated": True,
+        "cardio_fitness_level": True,
+        "oxygen_average": True,
+        "oxygen_lower_bound": True,
+        "oxygen_upper_bound": True,
+        "oxygen_standard_deviation": True,
+        "daily_respiratory_rate": True,
+        "sleep_respiratory_rates": True,
+        "sleep_respiratory_standard_deviation": True,
+        "sleep_respiratory_signal_to_noise": True,
+        "floors": True,
+        "sedentary_minutes": True,
+        "heart_zone_minutes": True,
+        "heart_zone_thresholds": True,
+        "heart_zone_calories": True,
+        "weight_kg": True,
+        "body_fat_percentage": True,
+        "height_m": True,
+    }
+    assert result["capabilities"] == {
+        "core_activity": {
+            "enabled": True,
+            "scope_granted": True,
+            "last_refresh_success": True,
+            "data_available": True,
+            "error_category": None,
+        },
+        "sleep": {
+            "enabled": True,
+            "scope_granted": True,
+            "last_refresh_success": True,
+            "data_available": True,
+            "error_category": None,
+        },
+        "body_measurements": {
+            "enabled": True,
+            "scope_granted": True,
+            "last_refresh_success": True,
+            "data_available": True,
+            "error_category": None,
+        },
+        "nutrition": {
+            "enabled": True,
+            "scope_granted": True,
+            "last_refresh_success": True,
+            "data_available": True,
+            "error_category": None,
+        },
+        "paired_devices": {
+            "enabled": True,
+            "scope_granted": True,
+            "last_refresh_success": True,
+            "data_available": True,
+            "error_category": "unknown",
+        },
+    }
+    assert result["history"]["bounds"] == {"start": "2042-07-13", "end": "2042-07-13"}
+    assert result["backfill"] == {
+        "cursor": "2042-07-01",
+        "complete": False,
+        "expanded_cursor": "2042-04-14",
+        "expanded_complete": True,
+    }
+
+    exposed = repr(result)
+    assert "Sample Alpha" not in exposed
+    assert "sample_alpha" not in exposed.lower()
+    for forbidden in FORBIDDEN:
+        assert forbidden not in exposed
+    for health_value in (
+        "2410.5",
+        "1830.0",
+        "2150.0",
+        "402.0",
+        "21.4",
+        "1.778",
+        "42.5",
+        "96.2",
+        "133",
+        "159",
+        "184.2",
+        "80.5",
+        "vigorous",
+    ):
+        assert health_value not in exposed
+
+
+def test_recursive_redaction_drops_nested_identifiers_and_raw_values() -> None:
+    """Sensitive key fragments remove their nested values at every depth."""
+    raw = {
+        "outer": [
+            {
+                "pairedDevices": [
+                    {
+                        "name": "users/me/pairedDevices/private-device-123",
+                        "productName": "Private Tracker Model",
+                    }
+                ],
+                "macAddress": "AA:BB:CC:DD:EE:FF",
+                "resource": {"name": "users/me/pairedDevices/private-device-123"},
+                "identityDigest": "private-paired-digest",
+                "foodName": "Private breakfast",
+                "nutrition_name": "Private breakfast",
+                "nutritionName": "Private breakfast",
+                "nutrition-name": "Private breakfast",
+                "accessToken": "secret-access-token",
+                "features": ["HEART_RATE"],
+                "rawGoogleError": {
+                    "message": "private-google-error",
+                    "details": [{"person": "Sample Alpha"}],
+                },
+            }
+        ]
+    }
+
+    redacted = _redact_recursive(raw)
+
+    exposed = repr(redacted)
+    for forbidden in FORBIDDEN:
+        assert forbidden not in exposed
+    assert redacted == {
+        "outer": [{"pairedDevices": [{"name": REDACTED}]}]
+    }
+
+
+def test_recursive_redaction_sanitizes_scalar_leaves_in_all_containers() -> None:
+    """Generic keys cannot make an unsafe scalar value diagnostic-safe."""
+    raw = {
+        "message": "Google Health rejected Sample Alpha's private request",
+        "value": 80.5,
+        "category_like_value": "fitbit",
+        "timestamp_like_value": NOW.isoformat(),
+        "details": [
+            "USERS/ME/PAIREDDEVICES/PRIVATE-DEVICE-123",
+            "aA:bB:cC:dD:eE:fF",
+            "bEaReR Private-Access-Token",
+            (
+                "Private breakfast",
+                "Private Tracker Model",
+                "device-identifier-123",
+            ),
+        ],
+        "safe_values": [
+            True,
+            None,
+            {"updated_at": NOW.isoformat()},
+            {"error_category": "temporary"},
+        ],
+    }
+
+    redacted = _redact_recursive(raw)
+
+    assert redacted == {
+        "message": REDACTED,
+        "value": REDACTED,
+        "category_like_value": REDACTED,
+        "timestamp_like_value": REDACTED,
+        "details": [
+            REDACTED,
+            REDACTED,
+            REDACTED,
+            (REDACTED, REDACTED, REDACTED),
+        ],
+        "safe_values": [
+            True,
+            None,
+            {"updated_at": NOW.isoformat()},
+            {"error_category": "temporary"},
+        ],
+    }
+
+
+def test_redaction_preserves_safe_count_status_and_category_fields() -> None:
+    """Boundary-aware classification retains bounded operational diagnostics."""
+    safe = {
+        "valid_count": 3,
+        "ValidCount": 4,
+        "VALIDCOUNT": 6,
+        "status_code": 200,
+        "STATUS-CODE": 204,
+        "statuscode": 201,
+        "resource_count": 2,
+        "Resource.Count": 5,
+        "RESOURCECOUNT": 7,
+        "product_supported": True,
+        "Product-Supported": False,
+        "PRODUCTSUPPORTED": True,
+        "authorization_healthy": True,
+        "last_attempt": NOW.isoformat(),
+        "error_category": "temporary",
+        "nested": [
+            {
+                "feature_available": False,
+                "device_count": 1,
+                "updated_at": NOW.isoformat(),
+            }
+        ],
+    }
+
+    assert _redact_recursive(safe) == safe
+
+
+def test_redaction_removes_case_and_separator_sensitive_key_variants() -> None:
+    """Exact and compound sensitive key tokens are removed in every common style."""
+    raw = {
+        "AccessToken": "private",
+        "access-token": "private",
+        "ACCESS.TOKEN": "private",
+        "Authorization Code": "private",
+        "ClientID": "private",
+        "client" + "_secret": "private",
+        "DATA_POINTS": ["private"],
+        "GoogleUserId": "private",
+        "identity-digest": "private",
+        "MAC Address": "private",
+        "rawPayload": {"message": "private"},
+        "".join(("resource", "Name")): "private",
+        "food.name": "private",
+        "Nutrition Name": "private",
+        "ProductName": "private",
+        "model-name": "private",
+        "".join(("device", "Identifier")): "private",
+        "featureList": ["private"],
+    }
+
+    assert _redact_recursive(raw) == {}
+
+
+def test_body_capability_reports_historical_latest_measurement_available() -> None:
+    """Body availability follows the latest-measurement state used by entities."""
+    snapshot = CoordinatorSnapshot(
+        last_success=NOW,
+        latest_weight_kg=80.5,
+        latest_weight_at=date(2042, 7, 10),
+    )
+    scope_grant = validate_granted_scopes(
+        BASE_SCOPES,
+        {"include_body_measurements": True},
+    )
+
+    capabilities = _summarize_capabilities(snapshot, scope_grant)
+
+    assert capabilities["body_measurements"] == {
+        "enabled": True,
+        "scope_granted": True,
+        "last_refresh_success": True,
+        "data_available": True,
+        "error_category": None,
+    }
+
+
+def test_baseline_capability_availability_includes_heart_and_sleep_stage_data() -> None:
+    """Capability health recognizes every normalized baseline data family."""
+    snapshot = CoordinatorSnapshot(
+        current_day=DailySummary(
+            date=date(2042, 7, 13),
+            resting_heart_rate=54.0,
+            sleep_stages={"deep": 60.0},
+        ),
+        last_success=NOW,
+    )
+    scope_grant = validate_granted_scopes(BASE_SCOPES, {})
+
+    capabilities = _summarize_capabilities(snapshot, scope_grant)
+
+    assert capabilities["core_activity"]["data_available"] is True
+    assert capabilities["sleep"]["data_available"] is True
+
+
+@pytest.mark.parametrize(
+    ("capability_id", "field", "value", "expanded"),
+    [
+        (CapabilityId.CORE_ACTIVITY, "steps", 0, False),
+        (CapabilityId.CORE_ACTIVITY, "fitbit_steps", 1, False),
+        (CapabilityId.CORE_ACTIVITY, "distance_m", 1.0, False),
+        (CapabilityId.CORE_ACTIVITY, "active_energy_kcal", 1.0, False),
+        (CapabilityId.CORE_ACTIVITY, "exercise_minutes", 1.0, False),
+        (CapabilityId.CORE_ACTIVITY, "resting_heart_rate", 1.0, False),
+        (CapabilityId.CORE_ACTIVITY, "average_heart_rate", 1.0, False),
+        (CapabilityId.CORE_ACTIVITY, "minimum_heart_rate", 1.0, False),
+        (CapabilityId.CORE_ACTIVITY, "maximum_heart_rate", 1.0, False),
+        (CapabilityId.CORE_ACTIVITY, "hrv_ms", 1.0, False),
+        (CapabilityId.CORE_ACTIVITY, "total_energy_kcal", 1.0, False),
+        (
+            CapabilityId.CORE_ACTIVITY,
+            "workouts",
+            (
+                WorkoutSummary(
+                    activity_type="PRIVATE_WORKOUT_TYPE",
+                    duration_minutes=47.0,
+                ),
+            ),
+            False,
+        ),
+        (
+            CapabilityId.CORE_ACTIVITY,
+            "active_zone_minutes",
+            {"fat_burn": 1.0},
+            True,
+        ),
+        (CapabilityId.CORE_ACTIVITY, "vo2_max", 1.0, True),
+        (CapabilityId.CORE_ACTIVITY, "vo2_estimated", False, True),
+        (CapabilityId.CORE_ACTIVITY, "cardio_fitness_level", "GOOD", True),
+        (CapabilityId.CORE_ACTIVITY, "oxygen_average", 1.0, True),
+        (CapabilityId.CORE_ACTIVITY, "oxygen_lower_bound", 1.0, True),
+        (CapabilityId.CORE_ACTIVITY, "oxygen_upper_bound", 1.0, True),
+        (CapabilityId.CORE_ACTIVITY, "oxygen_standard_deviation", 1.0, True),
+        (CapabilityId.CORE_ACTIVITY, "daily_respiratory_rate", 1.0, True),
+        (CapabilityId.CORE_ACTIVITY, "floors", 0, True),
+        (CapabilityId.CORE_ACTIVITY, "sedentary_minutes", 1.0, True),
+        (
+            CapabilityId.CORE_ACTIVITY,
+            "heart_zone_minutes",
+            {"vigorous": 1.0},
+            True,
+        ),
+        (
+            CapabilityId.CORE_ACTIVITY,
+            "heart_zone_thresholds",
+            {"vigorous": (1, 2)},
+            True,
+        ),
+        (
+            CapabilityId.CORE_ACTIVITY,
+            "heart_zone_calories",
+            {"vigorous": 1.0},
+            True,
+        ),
+        (CapabilityId.SLEEP, "sleep_minutes", 1.0, False),
+        (CapabilityId.SLEEP, "sleep_stages", {"deep": 1.0}, False),
+        (CapabilityId.SLEEP, "sleep_period_minutes", 0.0, False),
+        (CapabilityId.SLEEP, "sleep_onset_minutes", 0.0, False),
+        (CapabilityId.SLEEP, "sleep_after_wake_minutes", 0.0, False),
+        (
+            CapabilityId.SLEEP,
+            "sleep_respiratory_rates",
+            {"full": 1.0},
+            True,
+        ),
+        (
+            CapabilityId.SLEEP,
+            "sleep_respiratory_standard_deviation",
+            1.0,
+            True,
+        ),
+        (
+            CapabilityId.SLEEP,
+            "sleep_respiratory_signal_to_noise",
+            1.0,
+            True,
+        ),
+    ],
+)
+def test_capability_availability_matches_every_normalized_family(
+    capability_id: CapabilityId,
+    field: str,
+    value: object,
+    expanded: bool,
+) -> None:
+    """Every exposed field family makes its owning capability available."""
+    summary = (
+        DailySummary(
+            date=date(2042, 7, 13),
+            expanded=ExpandedDailyMetrics(**{field: value}),
+        )
+        if expanded
+        else DailySummary(date=date(2042, 7, 13), **{field: value})
+    )
+    day = _summarize_day(summary)
+    capabilities = _summarize_capabilities(
+        CoordinatorSnapshot(current_day=summary, last_success=NOW),
+        validate_granted_scopes(BASE_SCOPES, {}),
+    )
+    availability_key = (
+        "expanded_metric_availability" if expanded else "metric_availability"
+    )
+
+    assert day[availability_key][field] is True
+    assert capabilities[capability_id.value]["data_available"] is True
+    assert "PRIVATE_WORKOUT_TYPE" not in repr(day)
+    assert "47.0" not in repr(day)
+
+
+def test_empty_summary_reports_all_normalized_families_unavailable() -> None:
+    """Missing data stays unavailable without inferred zeroes."""
+    summary = DailySummary(date=date(2042, 7, 13))
+    day = _summarize_day(summary)
+    capabilities = _summarize_capabilities(
+        CoordinatorSnapshot(current_day=summary, last_success=NOW),
+        validate_granted_scopes(BASE_SCOPES, {}),
+    )
+
+    assert all(value is False for value in day["metric_availability"].values())
+    assert all(
+        value is False for value in day["expanded_metric_availability"].values()
+    )
+    assert capabilities["core_activity"]["data_available"] is False
+    assert capabilities["sleep"]["data_available"] is False
+
+
+async def test_diagnostics_handles_disabled_entry_without_runtime_data(hass) -> None:
+    """Disabled entries should expose safe static diagnostics instead of raising."""
+    entry = MagicMock()
+    entry.title = "Sample Alpha"
+    entry.data = {
+        "person_slug": "sample_alpha",
+        "client_id": "public-client-id",
+        "client" + "_secret": "top-secret-client-value",
+        "refresh" + "_token": "secret-refresh-token",
+    }
+    del entry.runtime_data
+
+    result = await async_get_config_entry_diagnostics(hass, entry)
+
+    assert result == {
+        "entry": {
+            "loaded": False,
+        },
+        "coordinator": None,
+        "capabilities": {},
+        "current_day": {
+            "source": "unavailable",
+            "metric_availability": {
+                "steps": False,
+                "fitbit_steps": False,
+                "distance_m": False,
+                "active_energy_kcal": False,
+                "exercise_minutes": False,
+                "sleep_minutes": False,
+                "resting_heart_rate": False,
+                "average_heart_rate": False,
+                "minimum_heart_rate": False,
+                "maximum_heart_rate": False,
+                "hrv_ms": False,
+                "total_energy_kcal": False,
+                "workouts": False,
+                "nutrition_energy_kcal": False,
+                "hydration_ml": False,
+                "sleep_stages": False,
+                "sleep_period_minutes": False,
+                "sleep_onset_minutes": False,
+                "sleep_after_wake_minutes": False,
+            },
+            "expanded_metric_availability": {
+                "active_zone_minutes": False,
+                "vo2_max": False,
+                "vo2_estimated": False,
+                "cardio_fitness_level": False,
+                "oxygen_average": False,
+                "oxygen_lower_bound": False,
+                "oxygen_upper_bound": False,
+                "oxygen_standard_deviation": False,
+                "daily_respiratory_rate": False,
+                "sleep_respiratory_rates": False,
+                "sleep_respiratory_standard_deviation": False,
+                "sleep_respiratory_signal_to_noise": False,
+                "floors": False,
+                "sedentary_minutes": False,
+                "heart_zone_minutes": False,
+                "heart_zone_thresholds": False,
+                "heart_zone_calories": False,
+                "weight_kg": False,
+                "body_fat_percentage": False,
+                "height_m": False,
+            },
+        },
+        "history": {"bounds": {"start": None, "end": None}, "loaded_days_sampled": 0},
+        "backfill": {
+            "cursor": None,
+            "complete": False,
+            "expanded_cursor": None,
+            "expanded_complete": False,
+        },
+        "issues": ["entry_not_loaded"],
+    }
+
+    exposed = repr(result)
+    for forbidden in FORBIDDEN:
+        assert forbidden not in exposed

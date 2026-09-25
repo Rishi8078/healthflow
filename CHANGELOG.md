@@ -1,0 +1,295 @@
+# Changelog
+
+All notable public changes to Healthflow are recorded here.
+
+## Unreleased
+
+### Added
+
+- Added `sleep_start` and `sleep_end` timestamp sensors for the latest valid
+  reconciled sleep session. They come from the session's physical interval,
+  which Healthflow already reads to pick the latest session.
+
+### Safety And Compatibility
+
+- No new Google requests, data types, or OAuth scopes. No reauthorization is
+  required.
+- The normalized history store gains two optional (additive) summary fields at
+  schema version 3. Existing rows load with both values as `None` and are not
+  rewritten. Days synced after upgrading store the timestamps.
+- Existing config entries, entity IDs, and Recorder history are preserved.
+
+## 1.1.1-beta.1 - 2026-08-14
+
+### Added
+
+- Added bounded, memory-only performance measurements for current refresh and
+  backfill work. Each person retains only the latest 12 operations.
+- Added an allowlisted performance summary to downloadable diagnostics with
+  operation duration, Google request count and elapsed time, history read and
+  write timing, coordinator lock wait, outcome, backfill state, and enabled
+  capability names.
+- Added README and troubleshooting instructions for collecting one hour of CPU
+  history and diagnostics for every configured person.
+
+### Safety And Compatibility
+
+- This beta is diagnostic instrumentation, not a claimed CPU fix. It is
+  intended to identify which Healthflow phase, if any, aligns with reported
+  15-minute CPU spikes.
+- No new sensors, polling intervals, Google requests, background tasks,
+  Recorder rows, or persistent performance records were added.
+- Performance diagnostics contain no health values, OAuth material, Google
+  identifiers, request parameters, raw payloads, or exception messages.
+- Existing config entries, existing entity IDs, normalized history, and Home
+  Assistant Recorder history are preserved.
+- No OAuth reauthorization is required for this beta.
+
+### Affected-User Test Procedure
+
+1. Install the beta completely through HACS and complete the existing single
+   post-download restart sequence.
+2. Confirm every Healthflow person is loaded, then allow four normal
+   15-minute polling cycles without repeatedly running manual refresh.
+3. Capture Home Assistant CPU history covering the same hour.
+4. Download and review diagnostics for every configured person.
+5. Include the Healthflow and Home Assistant versions, installation type,
+   hardware, configured-person count, enabled options, backfill status, normal
+   CPU use, and spike level in the support report.
+6. Remove health values, credentials, account addresses, raw Google payloads,
+   unredacted storage, and personal health screenshots before sharing.
+
+## 1.1.0 - 2026-08-06
+
+### Added
+
+- Added Total calories burned today using Google's `total-calories`
+  `dataPoints:dailyRollUp` operation.
+- Added Sleep time in bed, Time to fall asleep, and Time in bed after waking
+  from Google's existing sleep authorization.
+- Expanded optional body measurements with Body-fat percentage and Height
+  alongside Weight. These entities are disabled by default and use the existing
+  health-metrics permission.
+- Added per-person optional nutrition support for Calories consumed today and
+  Water consumed today through `nutrition-log` and `hydration-log`.
+- Added optional paired-device Battery level and Paired-device last Google sync
+  entities for devices returned by Google.
+
+### Fixed
+
+- Corrected the Total calories daily-rollup request so its page count remains
+  within Google's maximum query-duration validation.
+- Added a bounded historical Height lookup for sparse measurements outside the
+  normal 90-day body-history window.
+- Preserved existing entity IDs, configuration entries, normalized history,
+  baseline authorization, and Home Assistant Recorder history during upgrades.
+- Lowered routine automatic refresh diagnostics from warning to debug while
+  keeping the operator-requested availability probe at info.
+- Kept optional capability failures isolated so declining nutrition or paired
+  device access does not stop baseline activity, health, or sleep sensors.
+- Hardened public-release history scanning without allowing unrelated local
+  branches to block a release from the checked-out public branch.
+
+### Privacy
+
+- Nutrition and paired-device support remains read-only and opt-in per person.
+- Healthflow does not retain food names, raw nutrition logs, MAC addresses,
+  raw paired-device resource IDs, device feature lists, OAuth credentials, or
+  raw Google API payloads.
+- Nutrition has no historical backfill. Normalized Calories consumed today and
+  Water consumed today begin with the first successful authorized refresh.
+
+### Upgrade And Nutrition Authorization
+
+1. Install `1.1.0` completely through HACS, then restart Home Assistant once.
+2. Do not delete or re-add any existing Healthflow person.
+3. For each person who wants nutrition sensors, open that existing Healthflow
+   entry, select **Configure**, and enable `include_nutrition`.
+4. Complete **Reauthenticate** for that same entry and same Google account.
+5. On Google's consent screen, approve Google Health nutrition access
+   (`googlehealth.nutrition.readonly`) in addition to the baseline permissions.
+6. Run the Healthflow refresh action or wait for the next 15-minute poll.
+7. Repeat the option and consent steps independently for each household member.
+
+Baseline sensors continue without nutrition reauthorization. If nutrition
+permission is declined, only Calories consumed today and Water consumed today
+remain unavailable.
+
+## 1.1.0-beta.2 - 2026-08-06
+
+### Fixed
+
+- Corrected the Total calories burned today daily-rollup request so its page
+  count remains within Google's maximum query-duration validation.
+- Added a bounded historical Height lookup when no measurement exists in the
+  normal body-history window. This retrieves the latest sparse measurement
+  without extending every body-metric backfill request.
+- Restricted the public-history privacy scanner to commits reachable from the
+  checked-out release branch. Unrelated local branches no longer block a clean
+  release, while the full patch, path, blob, credential, identity, and PNG
+  checks remain active for release history.
+
+### Upgrade And Test
+
+- Install the beta completely through HACS, then restart Home Assistant once.
+- Enable the disabled-by-default Total calories burned today and Height entities
+  if needed, run the Healthflow refresh action, and verify their live Google
+  values before this beta is promoted.
+- Existing entity IDs, normalized history, configuration entries, and OAuth
+  authorization are preserved.
+
+## 1.1.0-beta.1 - 2026-08-06
+
+### Added
+
+- Added Total calories burned today and detailed sleep-timing entities from the
+  existing baseline Google Health authorization.
+- Expanded `include_body_measurements` to Weight, Body-fat percentage, and
+  Height. All three body entities are created disabled by default in the Home
+  Assistant entity registry.
+- Added per-person `include_nutrition` support for Calories consumed today and
+  Water consumed today through the optional
+  `googlehealth.nutrition.readonly` scope. This release starts normalized
+  nutrition with the first successful opt-in refresh and has
+  no historical nutrition backfill.
+- Added per-person `include_paired_devices` support through the optional
+  `googlehealth.settings.readonly` scope. Each current Google paired tracker or
+  scale can expose Battery level and Paired-device last sync entities.
+
+### Changed
+
+- Upgrades preserve existing config entries and baseline-only authorizations. New
+  optional permissions are requested through reauthorization on the same
+  person's entry, and declining one leaves baseline sensors working.
+- Added the eight static person entity keys without changing existing entity
+  identities. Paired battery and sync entities are created dynamically per
+  person and paired-device identity.
+- Clarified that setup accepts a person name and derives the slug used for
+  entity and action identity, while normalized history storage is owned by the
+  Home Assistant config-entry ID.
+- Extended normalized history with total calories, sleep timing, body fat,
+  height, and current-day nutrition fields. Paired-device metadata remains
+  current only and is excluded from normalized history.
+- Moved automatic redacted refresh diagnostics from warning to debug logging.
+  The explicitly requested optional-data availability probe now logs at info.
+
+### Privacy
+
+- Food names, raw nutrition logs, MAC addresses, raw paired-device resource
+  IDs, and device feature lists are excluded from normalized storage and
+  diagnostics.
+- Disabling an optional capability stops future requests. Nutrition values
+  already normalized for prior opt-in days and Home Assistant Recorder states
+  are not automatically erased; removal and purge decisions remain explicit
+  operator actions.
+
+### Upgrade
+
+- Update normally without deleting or re-adding the integration. Baseline
+  sensors require no reauthorization.
+- Enable nutrition or paired devices from each person's options, then complete
+  Google reauthorization for that same person. Repeat per person.
+
+## 1.0.4 - 2026-07-26
+
+### Fixed
+
+- Restored current-day active-zone minutes, floors, sedentary minutes, and
+  heart-rate-zone minutes when Google has reconciled interval records but has
+  not yet published the corresponding daily rollups.
+- Kept Google's daily rollups authoritative whenever they are available, while
+  retaining the reconciled interval fallback only for an incomplete current day.
+- Added value-free diagnostics that report response counts and metric
+  availability without logging health values, OAuth credentials, identifiers,
+  or raw API payloads.
+
+### Verified
+
+- Confirmed the fallback against live Google Health data for three enrolled
+  people. Active-zone, sedentary, and heart-rate-zone sensors populated for all
+  three; floor sensors populated where Google returned current-day floor
+  records. The reference person's values remained populated after a second
+  manual refresh.
+- Confirmed the complete automated suite with 610 passing tests, Ruff, Python
+  compilation, and Home Assistant configuration validation.
+
+### Upgrade
+
+- No configuration, OAuth, entity ID, or history migration is required.
+- Install the update completely through HACS, then restart Home Assistant once.
+- After restart, use the Healthflow refresh action or wait for the next
+  15-minute poll.
+
+## 1.0.3 - 2026-07-26
+
+### Fixed
+
+- Accepted Google Health daily rollup responses that end at `23:59:59` on the
+  same civil date, matching Google's documented response format.
+- Preserved support for daily rollups that end at midnight on the following
+  civil date.
+
+### Upgrade
+
+- No configuration, OAuth, entity ID, or history migration is required.
+- Install the update completely through HACS, then restart Home Assistant once.
+- After restart, use the Healthflow refresh action or wait for the next
+  15-minute poll.
+
+## 1.0.2 - 2026-07-26
+
+### Fixed
+
+- Corrected the Google Health `dailyRollUp` request to use the documented
+  `CivilDateTime` structure. This restores active-zone minutes, floors, sedentary
+  minutes, and heart-rate-zone minute rollups when Google provides source data.
+- Accepted daily-rollup boundaries where Google omits the optional midnight time
+  object.
+
+### Upgrade
+
+- No configuration, OAuth, entity ID, or history migration is required.
+- Install the update completely through HACS, then restart Home Assistant once.
+- Daily oxygen saturation and daily VO2 max remain daily summary metrics and may
+  appear after Google finishes processing that day's source data.
+
+## 1.0.1 - 2026-07-22
+
+### Fixed
+
+- Reduced core history backfill requests from 31-day to seven-day windows so high-volume
+  heart-rate history remains below Google Health pagination safety limits.
+- Prevented an oversized history window from repeatedly retrying without advancing its
+  durable backfill checkpoint.
+
+### Upgrade
+
+- No configuration or OAuth changes are required. Install the update completely through
+  HACS, then restart Home Assistant once.
+- Existing person entries, entity IDs, recorder history, and normalized integration history
+  are preserved.
+
+## 1.0.0 - 2026-07-22
+
+### Added
+
+- User-owned Google OAuth through Home Assistant Application Credentials with exactly
+  three read-only Google Health scopes.
+- Independent person-scoped config entries, stable entity identities, reauthentication,
+  and per-person body-measurement opt-in.
+- Core activity, sleep, workout, heart, source, synchronization, and backfill entities.
+- Expanded active-zone, VO2 max, oxygen, respiratory, floors, sedentary, heart-zone, and
+  optional weight entities.
+- Fifteen-minute current polling, five-minute manual-refresh cooldown, resumable bounded
+  history backfill, normalized WebSocket history, and value-free optional-data probing.
+- Partial metric-group recovery, explicit unavailable-versus-zero semantics, redacted
+  diagnostics, and strict normalized history validation.
+- HACS metadata, public brand assets, installation and operations documentation, security
+  policy, contribution guidelines, code of conduct, and structured issue forms.
+
+### Privacy
+
+- No hosted/shared OAuth backend.
+- Raw Google responses, individual samples, OAuth credentials, Google identifiers, and
+  personal health values are excluded from persisted integration history and diagnostics.
+- Weight collection is disabled unless each person explicitly opts in.

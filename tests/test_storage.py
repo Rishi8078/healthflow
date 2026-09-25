@@ -1,0 +1,1903 @@
+"""Tests for durable, normalized Healthflow daily history."""
+
+import asyncio
+import json
+import os
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta, timezone
+from math import inf, nan
+from pathlib import Path
+
+import pytest
+from homeassistant.const import EVENT_HOMEASSISTANT_FINAL_WRITE
+from homeassistant.helpers.storage import Store
+from homeassistant.util.file import WriteError
+
+from custom_components.healthflow import models
+from custom_components.healthflow import storage as storage_module
+from custom_components.healthflow.capabilities import CapabilityId
+from custom_components.healthflow.models import (
+    DailySummary,
+    ExpandedDailyMetrics,
+    SourceKind,
+    WorkoutSummary,
+)
+from custom_components.healthflow.performance import PerformanceRecorder
+from custom_components.healthflow.storage import HealthHistoryStore, HistoryStoreError
+
+_PARITY_FIXTURE_YEAR = int("".join(("20", "26")))
+
+
+def summary_for(day: str, **overrides: object) -> DailySummary:
+    """Create a complete immutable summary so persistence covers every field."""
+    values: dict[str, object] = {
+        "date": date.fromisoformat(day),
+        "steps": 6200,
+        "fitbit_steps": 5800,
+        "distance_m": 4675.25,
+        "active_energy_kcal": 512.5,
+        "exercise_minutes": 45.0,
+        "sleep_minutes": 402.0,
+        "sleep_stages": {"deep": 92.0, "light": 240.0, "rem": 70.0},
+        "resting_heart_rate": 54.0,
+        "average_heart_rate": 76.5,
+        "minimum_heart_rate": 48.0,
+        "maximum_heart_rate": 146.0,
+        "hrv_ms": 38.25,
+        "workouts": (
+            WorkoutSummary(
+                activity_type="WALKING",
+                duration_minutes=30.5,
+                start=datetime(2042, 7, 12, 14, 30, tzinfo=timezone(timedelta(hours=-4))),
+                end=datetime(2042, 7, 12, 15, 1, tzinfo=timezone(timedelta(hours=-4))),
+                active_energy_kcal=120.75,
+            ),
+        ),
+        "source": SourceKind.MIXED,
+        "complete": True,
+        "updated_at": datetime(2042, 7, 13, 1, 15, 30, 123456, tzinfo=UTC),
+    }
+    values.update(overrides)
+    return DailySummary(**values)  # type: ignore[arg-type]
+
+
+@pytest.fixture
+def store(hass) -> HealthHistoryStore:
+    """Create an isolated Store-backed history instance."""
+    return HealthHistoryStore(hass, "entry-id")
+
+
+@pytest.fixture(autouse=True)
+def mirror_history_store_writes_to_disk(hass, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Keep the mocked Store writer and this component's direct reader aligned."""
+    original_write = Store._async_write_data
+    storage_dir = Path(hass.config.path(".storage"))
+
+    def remove_history_files() -> None:
+        if storage_dir.exists():
+            for path in storage_dir.glob("healthflow.*.history"):
+                path.unlink()
+
+    async def mirror_write(store: Store[object], data: dict[str, object]) -> None:
+        await original_write(store, data)
+        if not store.key.startswith("healthflow."):
+            return
+        path = Path(store.path)
+        serialized = json.dumps(data)
+
+        def write_document() -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(serialized)
+
+        await store.hass.async_add_executor_job(write_document)
+
+    remove_history_files()
+    monkeypatch.setattr(Store, "_async_write_data", mirror_write)
+    yield
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_FINAL_WRITE)
+    hass.loop.run_until_complete(hass.async_block_till_done())
+    monkeypatch.undo()
+    remove_history_files()
+
+
+def _persisted_keys(value: object) -> set[str]:
+    """Collect mapping keys from a saved document for schema assertions."""
+    if isinstance(value, Mapping):
+        return set(value) | {
+            key
+            for child in value.values()
+            for key in _persisted_keys(child)
+        }
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return {key for child in value for key in _persisted_keys(child)}
+    return set()
+
+
+async def test_performance_records_public_storage_query_once(
+    store: HealthHistoryStore,
+) -> None:
+    """The public query boundary contributes exactly one read measurement."""
+    recorder = PerformanceRecorder()
+    operation = recorder.begin(
+        "current_refresh",
+        backfill_active=False,
+        enabled_capabilities=(),
+    )
+    assert operation is not None
+    token = operation.activate()
+    try:
+        summary = summary_for("2042-07-12")
+        await store.async_upsert(summary)
+        assert await store.async_query(summary.date, summary.date) == [summary]
+    finally:
+        operation.finish("success")
+        operation.deactivate(token)
+
+    record = recorder.snapshot()[0]
+    assert record.storage_read_count == 1
+
+
+@pytest.mark.parametrize(
+    "write_operation",
+    (
+        "async_upsert",
+        "async_set_backfill_checkpoint",
+        "async_checkpoint_expanded",
+    ),
+)
+async def test_performance_records_each_public_storage_write_once(
+    store: HealthHistoryStore,
+    write_operation: str,
+) -> None:
+    """Each named public write boundary independently contributes one measurement."""
+    recorder = PerformanceRecorder()
+    operation = recorder.begin(
+        "current_refresh",
+        backfill_active=False,
+        enabled_capabilities=(),
+    )
+    assert operation is not None
+    token = operation.activate()
+    try:
+        summary = summary_for("2042-07-12")
+        if write_operation == "async_upsert":
+            await store.async_upsert(summary)
+        elif write_operation == "async_set_backfill_checkpoint":
+            await store.async_set_backfill_checkpoint(date(2042, 7, 1))
+        else:
+            await store.async_checkpoint_expanded(summary, date(2042, 7, 12))
+    finally:
+        operation.finish("success")
+        operation.deactivate(token)
+
+    record = recorder.snapshot()[0]
+    assert record.storage_write_count == 1
+
+
+async def test_performance_timing_preserves_history_store_error(
+    hass,
+    store: HealthHistoryStore,
+) -> None:
+    """A timed public read still propagates a persisted-history validation error."""
+    await Store[dict[str, object]](hass, 1, store.key).async_save({"schema_version": 99})
+    recorder = PerformanceRecorder()
+    operation = recorder.begin(
+        "current_refresh",
+        backfill_active=False,
+        enabled_capabilities=(),
+    )
+    assert operation is not None
+    token = operation.activate()
+    try:
+        with pytest.raises(HistoryStoreError, match="unsupported history schema"):
+            await store.async_query(date(2042, 7, 12), date(2042, 7, 12))
+    finally:
+        operation.finish("storage_error")
+        operation.deactivate(token)
+
+    assert recorder.snapshot()[0].storage_read_count == 1
+
+
+async def test_timing_does_not_change_persisted_document_schema(
+    hass,
+    store: HealthHistoryStore,
+) -> None:
+    """History writes remain free of performance and operation-record fields."""
+    summary = summary_for("2042-07-12")
+    await store.async_upsert(summary)
+    await store.async_set_backfill_checkpoint(date(2042, 7, 1))
+
+    persisted = await Store[dict[str, object]](hass, 1, store.key).async_load()
+    assert persisted is not None
+    forbidden = {
+        "performance",
+        "duration",
+        "request_count",
+        "operation",
+        "started_at",
+        "duration_ms",
+        "google_request_count",
+        "storage_read_count",
+        "storage_write_count",
+        "slowest_phase",
+    }
+    assert _persisted_keys(persisted).isdisjoint(forbidden)
+
+
+async def test_new_store_has_no_access_to_an_old_recorder(
+    hass,
+    store: HealthHistoryStore,
+) -> None:
+    """A new store instance owns no recorder or prior in-memory measurements."""
+    recorder = PerformanceRecorder()
+    operation = recorder.begin(
+        "current_refresh",
+        backfill_active=False,
+        enabled_capabilities=(),
+    )
+    assert operation is not None
+    token = operation.activate()
+    try:
+        await store.async_query(date(2042, 7, 12), date(2042, 7, 12))
+    finally:
+        operation.finish("success")
+        operation.deactivate(token)
+
+    restarted = HealthHistoryStore(hass, "entry-id")
+    assert not any(isinstance(value, PerformanceRecorder) for value in vars(restarted).values())
+    assert len(recorder.snapshot()) == 1
+
+
+async def test_timing_clock_failure_does_not_mask_storage_result(
+    store: HealthHistoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A monotonic clock failure cannot turn a successful public read into an error."""
+    def failing_perf_counter() -> float:
+        raise RuntimeError("clock unavailable")
+
+    monkeypatch.setattr(storage_module, "perf_counter", failing_perf_counter, raising=False)
+    recorder = PerformanceRecorder()
+    operation = recorder.begin(
+        "current_refresh",
+        backfill_active=False,
+        enabled_capabilities=(),
+    )
+    assert operation is not None
+    token = operation.activate()
+    try:
+        assert await store.async_query(date(2042, 7, 12), date(2042, 7, 12)) == []
+    finally:
+        operation.finish("success")
+        operation.deactivate(token)
+
+
+async def test_timing_start_cancellation_does_not_mask_storage_result(
+    store: HealthHistoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancellation raised by the timing clock is only a telemetry failure."""
+    def cancelled_perf_counter() -> float:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(storage_module, "perf_counter", cancelled_perf_counter)
+
+    assert await store.async_query(date(2042, 7, 12), date(2042, 7, 12)) == []
+
+
+async def test_timing_start_cancellation_does_not_mask_history_store_error(
+    hass,
+    store: HealthHistoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Timing cancellation cannot replace an error raised by the storage operation."""
+    await Store[dict[str, object]](hass, 1, store.key).async_save({"schema_version": 99})
+
+    def cancelled_perf_counter() -> float:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(storage_module, "perf_counter", cancelled_perf_counter)
+
+    with pytest.raises(HistoryStoreError, match="unsupported history schema"):
+        await store.async_query(date(2042, 7, 12), date(2042, 7, 12))
+
+
+async def test_timing_recording_cancellation_does_not_mask_storage_result(
+    store: HealthHistoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancellation raised while recording is only a telemetry failure."""
+    def cancelled_recording(_duration: object) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(storage_module, "record_storage_read", cancelled_recording)
+
+    assert await store.async_query(date(2042, 7, 12), date(2042, 7, 12)) == []
+
+
+async def test_timing_end_clock_failure_preserves_storage_operation_cancellation(
+    store: HealthHistoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Genuine task cancellation survives an observational end-clock failure."""
+    await store.async_load()
+    await store._lock.acquire()
+    calls = 0
+
+    def fail_on_end() -> float:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return 1.0
+        raise RuntimeError("clock unavailable")
+
+    monkeypatch.setattr(storage_module, "perf_counter", fail_on_end, raising=False)
+    recorder = PerformanceRecorder()
+    operation = recorder.begin(
+        "current_refresh",
+        backfill_active=False,
+        enabled_capabilities=(),
+    )
+    assert operation is not None
+    token = operation.activate()
+    try:
+        query = asyncio.create_task(store.async_query(date(2042, 7, 12), date(2042, 7, 12)))
+        await asyncio.sleep(0)
+        query.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await query
+    finally:
+        store._lock.release()
+        operation.finish("cancelled")
+        operation.deactivate(token)
+
+
+def _summary_payload(summary: DailySummary) -> dict[str, object]:
+    """Return a deliberately explicit persisted v1 summary fixture."""
+    return {
+        "date": summary.date.isoformat(),
+        "steps": summary.steps,
+        "fitbit_steps": summary.fitbit_steps,
+        "distance_m": summary.distance_m,
+        "active_energy_kcal": summary.active_energy_kcal,
+        "exercise_minutes": summary.exercise_minutes,
+        "sleep_minutes": summary.sleep_minutes,
+        "sleep_stages": dict(summary.sleep_stages),
+        "resting_heart_rate": summary.resting_heart_rate,
+        "average_heart_rate": summary.average_heart_rate,
+        "minimum_heart_rate": summary.minimum_heart_rate,
+        "maximum_heart_rate": summary.maximum_heart_rate,
+        "hrv_ms": summary.hrv_ms,
+        "workouts": [
+            {
+                "activity_type": workout.activity_type,
+                "duration_minutes": workout.duration_minutes,
+                "start": workout.start.isoformat() if workout.start else None,
+                "end": workout.end.isoformat() if workout.end else None,
+                "active_energy_kcal": workout.active_energy_kcal,
+            }
+            for workout in summary.workouts
+        ],
+        "source": summary.source.value,
+        "complete": summary.complete,
+        "updated_at": summary.updated_at.isoformat() if summary.updated_at else None,
+    }
+
+
+def _payload(summary: DailySummary, *, cursor: str | None = None) -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "summaries": {summary.date.isoformat(): _summary_payload(summary)},
+        "backfill_cursor": cursor,
+    }
+
+
+def _expanded_metrics() -> ExpandedDailyMetrics:
+    """Create a fully populated reviewed expanded-metrics value."""
+    return ExpandedDailyMetrics(
+        active_zone_minutes={"fat_burn": 12.0, "cardio": 8.0, "peak": 4.0},
+        vo2_max=42.5,
+        vo2_estimated=False,
+        cardio_fitness_level="GOOD",
+        oxygen_average=96.2,
+        oxygen_lower_bound=95.1,
+        oxygen_upper_bound=97.3,
+        oxygen_standard_deviation=0.4,
+        daily_respiratory_rate=15.4,
+        sleep_respiratory_rates={"deep": 14.1, "light": 15.2, "rem": 14.6, "full": 14.8},
+        sleep_respiratory_standard_deviation=0.7,
+        sleep_respiratory_signal_to_noise=3.2,
+        floors=7,
+        sedentary_minutes=480.0,
+        heart_zone_minutes={"vigorous": 23.5},
+        heart_zone_thresholds={"vigorous": (133, 159)},
+        heart_zone_calories={"vigorous": 184.2},
+        weight_kg=80.5,
+    )
+
+
+def _v2_payload(
+    summary: DailySummary,
+    *,
+    cursor: str | None = None,
+    expanded_cursor: str | None = None,
+) -> dict[str, object]:
+    return {
+        "schema_version": 2,
+        "summaries": {
+            summary.date.isoformat(): _summary_payload(summary)
+            | {"expanded": _expanded_payload(summary.expanded)}
+        },
+        "backfill_cursor": cursor,
+        "expanded_backfill_cursor": expanded_cursor,
+    }
+
+
+def _v3_payload(
+    summary: DailySummary,
+    *,
+    cursor: str | None = None,
+    expanded_cursor: str | None = None,
+    body_measurements_enabled: bool = False,
+) -> dict[str, object]:
+    return {
+        "schema_version": 3,
+        "summaries": {
+            summary.date.isoformat(): _summary_payload(summary)
+            | {
+                "total_energy_kcal": summary.total_energy_kcal,
+                "nutrition_energy_kcal": summary.nutrition_energy_kcal,
+                "hydration_ml": summary.hydration_ml,
+                "sleep_period_minutes": summary.sleep_period_minutes,
+                "sleep_onset_minutes": summary.sleep_onset_minutes,
+                "sleep_after_wake_minutes": summary.sleep_after_wake_minutes,
+                "sleep_start": _optional_isoformat(summary.sleep_start),
+                "sleep_end": _optional_isoformat(summary.sleep_end),
+                "expanded": _expanded_payload(summary.expanded)
+                | {
+                    "body_fat_percentage": summary.expanded.body_fat_percentage,
+                    "height_m": summary.expanded.height_m,
+                },
+            }
+        },
+        "backfill_cursor": cursor,
+        "expanded_backfill_cursor": expanded_cursor,
+        "body_measurements_enabled": body_measurements_enabled,
+    }
+
+
+def _optional_isoformat(value: datetime | None) -> str | None:
+    return value.isoformat() if value is not None else None
+
+
+def _legacy_v3_payload(
+    summary: DailySummary,
+    *,
+    cursor: str | None = None,
+    expanded_cursor: str | None = None,
+) -> dict[str, object]:
+    """Return schema-v3 data written before additive parity fields existed."""
+    return {
+        **_v2_payload(
+            summary,
+            cursor=cursor,
+            expanded_cursor=expanded_cursor,
+        ),
+        "schema_version": 3,
+        "body_measurements_enabled": False,
+    }
+
+
+def _expanded_payload(expanded: ExpandedDailyMetrics) -> dict[str, object]:
+    return {
+        "active_zone_minutes": dict(expanded.active_zone_minutes),
+        "vo2_max": expanded.vo2_max,
+        "vo2_estimated": expanded.vo2_estimated,
+        "cardio_fitness_level": expanded.cardio_fitness_level,
+        "oxygen_average": expanded.oxygen_average,
+        "oxygen_lower_bound": expanded.oxygen_lower_bound,
+        "oxygen_upper_bound": expanded.oxygen_upper_bound,
+        "oxygen_standard_deviation": expanded.oxygen_standard_deviation,
+        "daily_respiratory_rate": expanded.daily_respiratory_rate,
+        "sleep_respiratory_rates": dict(expanded.sleep_respiratory_rates),
+        "sleep_respiratory_standard_deviation": expanded.sleep_respiratory_standard_deviation,
+        "sleep_respiratory_signal_to_noise": expanded.sleep_respiratory_signal_to_noise,
+        "floors": expanded.floors,
+        "sedentary_minutes": expanded.sedentary_minutes,
+        "heart_zone_minutes": dict(expanded.heart_zone_minutes),
+        "heart_zone_thresholds": {
+            zone: list(thresholds) for zone, thresholds in expanded.heart_zone_thresholds.items()
+        },
+        "heart_zone_calories": dict(expanded.heart_zone_calories),
+        "weight_kg": expanded.weight_kg,
+    }
+
+
+async def test_schema_v1_migration_preserves_every_core_field_and_adds_empty_expanded(
+    hass,
+    store: HealthHistoryStore,
+) -> None:
+    """A validated v1 document is rewritten once as lossless current-schema data."""
+    summary = summary_for("2042-07-12")
+    original = _payload(summary, cursor="2042-07-01")
+    await Store[dict[str, object]](hass, 1, store.key).async_save(original)
+
+    assert await store.async_load() == [summary]
+    assert store.backfill_cursor == date(2042, 7, 1)
+    assert store.expanded_backfill_cursor is None
+
+    migrated = await Store[dict[str, object]](hass, 1, store.key).async_load()
+    assert migrated == _v3_payload(summary, cursor="2042-07-01")
+
+
+async def test_expanded_summary_round_trip_preserves_every_reviewed_field(
+    hass,
+    store: HealthHistoryStore,
+) -> None:
+    """Expanded immutable mappings and scalars remain lossless across Store reload."""
+    summary = summary_for("2042-07-13", expanded=_expanded_metrics())
+
+    await store.async_upsert(summary)
+    await store.async_set_backfill_checkpoint(date(2042, 7, 1))
+
+    reloaded = HealthHistoryStore(hass, "entry-id")
+    assert await reloaded.async_load() == [summary]
+
+
+async def test_parity_summary_round_trip_preserves_every_additive_field(
+    hass,
+    store: HealthHistoryStore,
+) -> None:
+    """New optional daily values remain exact across current-schema persistence."""
+    summary = DailySummary(
+        date=date(_PARITY_FIXTURE_YEAR, 7, 15),
+        total_energy_kcal=2345.6,
+        nutrition_energy_kcal=1820.0,
+        hydration_ml=2100.0,
+        sleep_period_minutes=445.0,
+        sleep_onset_minutes=8.0,
+        sleep_after_wake_minutes=12.0,
+        sleep_start=datetime(_PARITY_FIXTURE_YEAR, 7, 14, 22, 41, tzinfo=UTC),
+        sleep_end=datetime(_PARITY_FIXTURE_YEAR, 7, 15, 5, 8, tzinfo=timezone(timedelta(hours=2))),
+        expanded=ExpandedDailyMetrics(
+            body_fat_percentage=21.4,
+            height_m=1.778,
+        ),
+    )
+
+    await store.async_upsert(summary)
+    await store.async_set_backfill_checkpoint(date(_PARITY_FIXTURE_YEAR, 7, 1))
+
+    reloaded = HealthHistoryStore(hass, "entry-id")
+    assert await reloaded.async_load() == [summary]
+
+
+async def test_legacy_schema_v3_loads_additive_fields_as_none_without_rewrite(
+    hass,
+    store: HealthHistoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pre-parity schema-v3 rows retain both cursors and are not rewritten on load."""
+    summary = summary_for(f"{_PARITY_FIXTURE_YEAR}-07-15")
+    legacy = _legacy_v3_payload(
+        summary,
+        cursor=f"{_PARITY_FIXTURE_YEAR}-07-01",
+        expanded_cursor=f"{_PARITY_FIXTURE_YEAR}-07-10",
+    )
+    await Store[dict[str, object]](hass, 1, store.key).async_save(legacy)
+    saved: list[dict[str, object]] = []
+    original_save = store._store.async_save
+
+    async def capture_save(data: dict[str, object]) -> None:
+        saved.append(data)
+        await original_save(data)
+
+    monkeypatch.setattr(store._store, "async_save", capture_save)
+
+    row = (await store.async_load())[0]
+
+    assert row.total_energy_kcal is None
+    assert row.nutrition_energy_kcal is None
+    assert row.hydration_ml is None
+    assert row.sleep_period_minutes is None
+    assert row.sleep_onset_minutes is None
+    assert row.sleep_after_wake_minutes is None
+    assert row.sleep_start is None
+    assert row.sleep_end is None
+    assert row.expanded.body_fat_percentage is None
+    assert row.expanded.height_m is None
+    assert store.backfill_cursor == date(_PARITY_FIXTURE_YEAR, 7, 1)
+    assert store.expanded_backfill_cursor == date(_PARITY_FIXTURE_YEAR, 7, 10)
+    assert saved == []
+
+
+def test_additive_model_defaults_preserve_existing_construction() -> None:
+    """Legacy model construction exposes unavailable parity data without sentinels."""
+    row = DailySummary(date=date(_PARITY_FIXTURE_YEAR, 7, 15))
+    snapshot = models.CoordinatorSnapshot()
+
+    assert row.total_energy_kcal is None
+    assert row.nutrition_energy_kcal is None
+    assert row.hydration_ml is None
+    assert row.sleep_period_minutes is None
+    assert row.sleep_onset_minutes is None
+    assert row.sleep_after_wake_minutes is None
+    assert row.sleep_start is None
+    assert row.sleep_end is None
+    assert row.expanded.body_fat_percentage is None
+    assert row.expanded.height_m is None
+    assert snapshot.latest_body_fat_percentage is None
+    assert snapshot.latest_body_fat_at is None
+    assert snapshot.latest_height_m is None
+    assert snapshot.latest_height_at is None
+    assert snapshot.paired_devices == ()
+    assert snapshot.capability_states == {}
+
+
+def test_additive_capability_and_paired_device_records_preserve_values() -> None:
+    """Capability health and sanitized paired-device values are typed records."""
+    refreshed_at = datetime(_PARITY_FIXTURE_YEAR, 7, 15, 12, 30, tzinfo=UTC)
+    capability_state = models.CapabilityRefreshState(
+        enabled=True,
+        scope_granted=False,
+        last_success=refreshed_at,
+        error_category="authorization",
+    )
+    paired_device = models.PairedDeviceSummary(
+        identity_digest="4d3c2b1a",
+        device_type="TRACKER",
+        product_name="Example Tracker",
+        battery_status="MEDIUM",
+        battery_percentage=62,
+        last_sync=refreshed_at,
+    )
+    snapshot = models.CoordinatorSnapshot(
+        paired_devices=(paired_device,),
+        capability_states={CapabilityId.NUTRITION: capability_state},
+    )
+
+    assert snapshot.paired_devices == (paired_device,)
+    assert snapshot.capability_states == {CapabilityId.NUTRITION: capability_state}
+
+
+async def test_expanded_checkpoint_commits_summary_and_cursor_without_changing_core_cursor(
+    hass,
+    store: HealthHistoryStore,
+) -> None:
+    """Expanded backfill can advance independently while preserving the core checkpoint."""
+    await store.async_set_backfill_checkpoint(date(2042, 7, 1))
+    summary = summary_for("2042-07-13", expanded=_expanded_metrics())
+
+    await store.async_checkpoint_expanded(summary, date(2042, 7, 12))
+
+    assert store.backfill_cursor == date(2042, 7, 1)
+    assert store.expanded_backfill_cursor == date(2042, 7, 12)
+    reloaded = HealthHistoryStore(hass, "entry-id")
+    assert await reloaded.async_load() == [summary]
+    assert reloaded.backfill_cursor == date(2042, 7, 1)
+    assert reloaded.expanded_backfill_cursor == date(2042, 7, 12)
+
+
+async def test_enabling_body_measurements_resets_completed_expanded_cursor_once(
+    hass,
+    store: HealthHistoryStore,
+) -> None:
+    """The option transition is durable and a restart cannot restart it again."""
+    today = date(2042, 7, 21)
+    await store.async_load()
+    await store.async_checkpoint_expanded(
+        summary_for("2042-04-22"), date(2042, 4, 22)
+    )
+
+    await store.async_apply_body_measurement_option(True, today)
+
+    assert store.body_measurements_enabled is True
+    assert store.expanded_backfill_cursor == today
+    await store.async_checkpoint_expanded(
+        summary_for("2042-07-20"), date(2042, 7, 7)
+    )
+    restarted = HealthHistoryStore(hass, "entry-id")
+    await restarted.async_load()
+    await restarted.async_apply_body_measurement_option(True, today)
+    assert restarted.body_measurements_enabled is True
+    assert restarted.expanded_backfill_cursor == date(2042, 7, 7)
+
+
+async def test_disabling_body_measurements_transactionally_scrubs_all_body_fields(
+    hass,
+    store: HealthHistoryStore,
+) -> None:
+    """Opt-out removes stored body data while preserving unrelated data and cursors."""
+    today = date(2042, 7, 21)
+    measured = summary_for(
+        "2042-07-15",
+        expanded=replace(
+            _expanded_metrics(),
+            body_fat_percentage=21.4,
+            height_m=1.778,
+        ),
+    )
+    await store.async_load()
+    await store.async_set_backfill_checkpoint(date(2042, 7, 1))
+    await store.async_apply_body_measurement_option(True, today)
+    await store.async_checkpoint_expanded(measured, date(2042, 7, 7))
+
+    rows = await store.async_apply_body_measurement_option(False, today)
+
+    assert store.body_measurements_enabled is False
+    assert store.backfill_cursor == date(2042, 7, 1)
+    assert store.expanded_backfill_cursor == date(2042, 7, 7)
+    assert rows[0].expanded.weight_kg is None
+    assert rows[0].expanded.body_fat_percentage is None
+    assert rows[0].expanded.height_m is None
+    assert rows[0].steps == measured.steps
+    assert rows[0].expanded.vo2_max == 42.5
+    restarted = HealthHistoryStore(hass, "entry-id")
+    reloaded = await restarted.async_load()
+    assert restarted.body_measurements_enabled is False
+    assert restarted.backfill_cursor == date(2042, 7, 1)
+    assert restarted.expanded_backfill_cursor == date(2042, 7, 7)
+    assert reloaded[0].expanded.weight_kg is None
+    assert reloaded[0].expanded.body_fat_percentage is None
+    assert reloaded[0].expanded.height_m is None
+    assert reloaded[0].steps == measured.steps
+    assert reloaded[0].expanded.vo2_max == 42.5
+
+
+async def test_disabled_body_option_rescrubs_legacy_body_fat_and_height(
+    hass,
+    store: HealthHistoryStore,
+) -> None:
+    """A prior buggy opt-out cannot leave sensitive non-weight fields behind."""
+    today = date(2042, 7, 21)
+    leaked = summary_for(
+        "2042-07-15",
+        expanded=replace(
+            _expanded_metrics(),
+            weight_kg=None,
+            body_fat_percentage=21.4,
+            height_m=1.778,
+        ),
+    )
+    await store.async_load()
+    await store.async_set_backfill_checkpoint(date(2042, 7, 1))
+    await store.async_checkpoint_expanded(leaked, date(2042, 7, 7))
+
+    rows = await store.async_apply_body_measurement_option(False, today)
+
+    assert store.body_measurements_enabled is False
+    assert store.backfill_cursor == date(2042, 7, 1)
+    assert store.expanded_backfill_cursor == date(2042, 7, 7)
+    assert rows[0].expanded.weight_kg is None
+    assert rows[0].expanded.body_fat_percentage is None
+    assert rows[0].expanded.height_m is None
+    assert rows[0].expanded.vo2_max == 42.5
+    restarted = HealthHistoryStore(hass, "entry-id")
+    reloaded = await restarted.async_load()
+    assert restarted.body_measurements_enabled is False
+    assert restarted.backfill_cursor == date(2042, 7, 1)
+    assert restarted.expanded_backfill_cursor == date(2042, 7, 7)
+    assert reloaded[0].expanded.weight_kg is None
+    assert reloaded[0].expanded.body_fat_percentage is None
+    assert reloaded[0].expanded.height_m is None
+    assert reloaded[0].expanded.vo2_max == 42.5
+
+
+async def test_body_option_save_failure_leaves_summaries_and_cursors_unchanged(
+    hass,
+    store: HealthHistoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed opt-out write cannot partially scrub process memory."""
+    today = date(2042, 7, 21)
+    measured = summary_for(
+        "2042-07-15",
+        expanded=replace(
+            _expanded_metrics(),
+            body_fat_percentage=21.4,
+            height_m=1.778,
+        ),
+    )
+    await store.async_load()
+    await store.async_set_backfill_checkpoint(date(2042, 7, 1))
+    await store.async_apply_body_measurement_option(True, today)
+    await store.async_checkpoint_expanded(measured, date(2042, 7, 7))
+
+    async def fail_write(_data: dict[str, object]) -> None:
+        raise WriteError(OSError("disk unavailable"))
+
+    monkeypatch.setattr(store._store, "_async_write_data", fail_write)
+
+    with pytest.raises(HistoryStoreError, match="persist body measurement option"):
+        await store.async_apply_body_measurement_option(False, today)
+
+    assert store.body_measurements_enabled is True
+    assert store.backfill_cursor == date(2042, 7, 1)
+    assert store.expanded_backfill_cursor == date(2042, 7, 7)
+    retained = (await store.async_query(date(2042, 7, 15), date(2042, 7, 15)))[0]
+    assert retained.expanded.weight_kg == 80.5
+    assert retained.expanded.body_fat_percentage == 21.4
+    assert retained.expanded.height_m == 1.778
+    assert retained.steps == measured.steps
+    restarted = HealthHistoryStore(hass, "entry-id")
+    reloaded = await restarted.async_load()
+    assert restarted.body_measurements_enabled is True
+    assert restarted.backfill_cursor == date(2042, 7, 1)
+    assert restarted.expanded_backfill_cursor == date(2042, 7, 7)
+    assert reloaded == [measured]
+
+
+async def test_shutdown_drains_old_same_key_store_before_new_store_scrubs_body_data(
+    hass,
+) -> None:
+    """An unloaded store cannot later replace a newer opt-out scrub."""
+    today = date(2042, 7, 21)
+    measured = summary_for(
+        "2042-07-15",
+        expanded=replace(
+            _expanded_metrics(),
+            body_fat_percentage=21.4,
+            height_m=1.778,
+        ),
+    )
+    baseline = summary_for(
+        "2042-07-16",
+        steps=7100,
+        expanded=ExpandedDailyMetrics(floors=4),
+    )
+    old = HealthHistoryStore(hass, "entry-id")
+    await old.async_load()
+    await old.async_set_backfill_checkpoint(date(2042, 7, 1))
+    await old.async_apply_body_measurement_option(True, today)
+    await old.async_checkpoint_expanded(baseline, date(2042, 7, 7))
+    await old.async_upsert(measured)
+
+    await old.async_shutdown()
+
+    current = HealthHistoryStore(hass, "entry-id")
+    assert await current.async_load() == [measured, baseline]
+    await current.async_apply_body_measurement_option(False, today)
+
+    old._store._async_schedule_callback_delayed_write()
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_FINAL_WRITE)
+    await hass.async_block_till_done()
+
+    restarted = HealthHistoryStore(hass, "entry-id")
+    rows = await restarted.async_load()
+    assert restarted.body_measurements_enabled is False
+    assert restarted.backfill_cursor == date(2042, 7, 1)
+    assert restarted.expanded_backfill_cursor == date(2042, 7, 7)
+    assert [row.date for row in rows] == [measured.date, baseline.date]
+    assert all(row.expanded.weight_kg is None for row in rows)
+    assert all(row.expanded.body_fat_percentage is None for row in rows)
+    assert all(row.expanded.height_m is None for row in rows)
+    assert rows[0].steps == measured.steps
+    assert rows[0].expanded.vo2_max == measured.expanded.vo2_max
+    assert rows[1].steps == baseline.steps
+    assert rows[1].expanded.floors == baseline.expanded.floors
+
+
+async def test_shutdown_write_error_requeues_for_final_write_before_closing(
+    hass,
+    store: HealthHistoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed drain remains open and the requeued final write can persist."""
+    pending = summary_for("2042-07-17", steps=7300)
+    await store.async_load()
+    await store.async_set_backfill_checkpoint(date(2042, 7, 1))
+    await store.async_upsert(pending)
+    original_write = store._store._async_write_data
+    write_attempts = 0
+
+    async def fail_twice(data: dict[str, object]) -> None:
+        nonlocal write_attempts
+        write_attempts += 1
+        if write_attempts <= 2:
+            raise WriteError(OSError("disk unavailable"))
+        await original_write(data)
+
+    monkeypatch.setattr(store._store, "_async_write_data", fail_twice)
+
+    with pytest.raises(WriteError, match="disk unavailable"):
+        await store.async_shutdown()
+
+    assert await store.async_query(pending.date, pending.date) == [pending]
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_FINAL_WRITE)
+    await hass.async_block_till_done()
+
+    assert await store.async_query(pending.date, pending.date) == [pending]
+    await store.async_shutdown()
+    reloaded = HealthHistoryStore(hass, "entry-id")
+    assert await reloaded.async_load() == [pending]
+    assert reloaded.backfill_cursor == date(2042, 7, 1)
+
+    await store.async_shutdown()
+    assert write_attempts == 3
+    with pytest.raises(HistoryStoreError, match="shut down"):
+        await store.async_query(pending.date, pending.date)
+
+
+async def test_delayed_write_failure_immediately_before_shutdown_is_retried(
+    hass,
+    store: HealthHistoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delayed callback cannot consume a failed snapshot ahead of shutdown."""
+    pending = summary_for("2042-07-19", steps=7500)
+    await store.async_load()
+    await store.async_set_backfill_checkpoint(date(2042, 7, 1))
+    await store.async_upsert(pending)
+    original_write = store._store._async_write_data
+    write_started = asyncio.Event()
+    release_first_write = asyncio.Event()
+    write_attempts = 0
+
+    async def fail_first_write(data: dict[str, object]) -> None:
+        nonlocal write_attempts
+        write_attempts += 1
+        if write_attempts == 1:
+            write_started.set()
+            await release_first_write.wait()
+            raise WriteError(OSError("disk unavailable"))
+        await original_write(data)
+
+    monkeypatch.setattr(store._store, "_async_write_data", fail_first_write)
+
+    delayed_write = asyncio.create_task(store._store._async_callback_delayed_write())
+    await write_started.wait()
+    shutdown = asyncio.create_task(store.async_shutdown())
+    await asyncio.sleep(0)
+    release_first_write.set()
+    await delayed_write
+    await shutdown
+    await store.async_shutdown()
+
+    assert write_attempts == 2
+    restarted = HealthHistoryStore(hass, "entry-id")
+    assert await restarted.async_load() == [pending]
+    assert restarted.backfill_cursor == date(2042, 7, 1)
+    with pytest.raises(HistoryStoreError, match="shut down"):
+        await store.async_query(pending.date, pending.date)
+
+
+async def test_final_write_failure_immediately_before_shutdown_is_retried(
+    hass,
+    store: HealthHistoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A final callback cannot consume a failed snapshot ahead of shutdown."""
+    pending = summary_for("2042-07-20", steps=7600)
+    await store.async_load()
+    await store.async_set_backfill_checkpoint(date(2042, 7, 2))
+    await store.async_upsert(pending)
+    original_write = store._store._async_write_data
+    write_started = asyncio.Event()
+    release_first_write = asyncio.Event()
+    write_attempts = 0
+
+    async def fail_first_write(data: dict[str, object]) -> None:
+        nonlocal write_attempts
+        write_attempts += 1
+        if write_attempts == 1:
+            write_started.set()
+            await release_first_write.wait()
+            raise WriteError(OSError("disk unavailable"))
+        await original_write(data)
+
+    monkeypatch.setattr(store._store, "_async_write_data", fail_first_write)
+
+    hass.bus.async_fire(EVENT_HOMEASSISTANT_FINAL_WRITE)
+    await write_started.wait()
+    shutdown = asyncio.create_task(store.async_shutdown())
+    await asyncio.sleep(0)
+    release_first_write.set()
+    await hass.async_block_till_done()
+    await shutdown
+    await store.async_shutdown()
+
+    assert write_attempts == 2
+    restarted = HealthHistoryStore(hass, "entry-id")
+    assert await restarted.async_load() == [pending]
+    assert restarted.backfill_cursor == date(2042, 7, 2)
+    with pytest.raises(HistoryStoreError, match="shut down"):
+        await store.async_query(pending.date, pending.date)
+
+
+async def test_delayed_write_readback_mismatch_is_retried_before_shutdown_closes(
+    hass,
+    store: HealthHistoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed write is retained until its exact payload is read back."""
+    pending = summary_for("2042-07-21", steps=7700)
+    await store.async_load()
+    await store.async_set_backfill_checkpoint(date(2042, 7, 3))
+    await store.async_upsert(pending)
+    original_write = store._store._async_write_data
+    original_read = store._store._read_persisted_store_payload
+    write_completed = asyncio.Event()
+    release_first_write = asyncio.Event()
+    write_attempts = 0
+    read_attempts = 0
+
+    async def complete_first_write_then_block(data: dict[str, object]) -> None:
+        nonlocal write_attempts
+        write_attempts += 1
+        await original_write(data)
+        if write_attempts == 1:
+            write_completed.set()
+            await release_first_write.wait()
+
+    def mismatch_first_read() -> Mapping[str, object] | None:
+        nonlocal read_attempts
+        read_attempts += 1
+        if read_attempts == 1:
+            return {"unexpected": "payload"}
+        return original_read()
+
+    monkeypatch.setattr(
+        store._store, "_async_write_data", complete_first_write_then_block
+    )
+    monkeypatch.setattr(
+        store._store, "_read_persisted_store_payload", mismatch_first_read
+    )
+
+    delayed_write = asyncio.create_task(store._store._async_callback_delayed_write())
+    await write_completed.wait()
+    shutdown = asyncio.create_task(store.async_shutdown())
+    await asyncio.sleep(0)
+    release_first_write.set()
+    await delayed_write
+    await shutdown
+    await store.async_shutdown()
+
+    assert write_attempts == 2
+    assert read_attempts == 2
+    restarted = HealthHistoryStore(hass, "entry-id")
+    assert await restarted.async_load() == [pending]
+    assert restarted.backfill_cursor == date(2042, 7, 3)
+    with pytest.raises(HistoryStoreError, match="shut down"):
+        await store.async_query(pending.date, pending.date)
+
+
+async def test_cancelled_shutdown_retains_pending_for_repeated_shutdown(
+    hass,
+    store: HealthHistoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation cannot close the instance or discard its pending snapshot."""
+    pending = summary_for("2042-07-18", steps=7400)
+    await store.async_load()
+    await store.async_upsert(pending)
+    original_write = store._store._async_write_data
+    write_started = asyncio.Event()
+
+    async def block_write(_data: dict[str, object]) -> None:
+        write_started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(store._store, "_async_write_data", block_write)
+    shutdown = asyncio.create_task(store.async_shutdown())
+    await write_started.wait()
+    shutdown.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await shutdown
+
+    assert await store.async_query(pending.date, pending.date) == [pending]
+
+    monkeypatch.setattr(store._store, "_async_write_data", original_write)
+    await store.async_shutdown()
+    await store.async_shutdown()
+
+    reloaded = HealthHistoryStore(hass, "entry-id")
+    assert await reloaded.async_load() == [pending]
+    with pytest.raises(HistoryStoreError, match="shut down"):
+        await store.async_query(pending.date, pending.date)
+
+
+async def test_expanded_checkpoint_save_failure_keeps_in_memory_summary_and_cursor(
+    store: HealthHistoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The durable save must succeed before a checkpoint replaces process state."""
+    baseline = summary_for("2042-07-14", expanded=ExpandedDailyMetrics(floors=6))
+    replacement = summary_for("2042-07-14", expanded=ExpandedDailyMetrics(floors=7))
+    await store.async_load()
+    await store.async_checkpoint_expanded(baseline, date(2042, 7, 14))
+
+    async def fail_save(_document: dict[str, object]) -> None:
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(store._store, "async_save", fail_save)
+
+    with pytest.raises(OSError, match="disk unavailable"):
+        await store.async_checkpoint_expanded(replacement, date(2042, 7, 13))
+
+    assert store.expanded_backfill_cursor == date(2042, 7, 14)
+    assert (await store.async_query(date(2042, 7, 14), date(2042, 7, 14)))[
+        0
+    ] == baseline
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "message"),
+    [
+        (("unexpected",), 1, "expanded has invalid fields"),
+        (("active_zone_minutes", "unknown"), 1.0, "active_zone_minutes contains an invalid zone"),
+        (("heart_zone_thresholds", "vigorous"), [160, 133], "heart_zone_thresholds"),
+        (("oxygen_average",), nan, "oxygen_average"),
+    ],
+)
+async def test_invalid_expanded_history_fails_closed(
+    hass,
+    store: HealthHistoryStore,
+    path: tuple[str, ...],
+    value: object,
+    message: str,
+) -> None:
+    """Persisted expanded values must remain within the reviewed normalized contract."""
+    payload = _v2_payload(summary_for("2042-07-13", expanded=_expanded_metrics()))
+    summaries = payload["summaries"]
+    assert isinstance(summaries, dict)
+    row = summaries["2042-07-13"]
+    assert isinstance(row, dict)
+    expanded = row["expanded"]
+    assert isinstance(expanded, dict)
+    target = expanded
+    for key in path[:-1]:
+        nested = target[key]
+        assert isinstance(nested, dict)
+        target = nested
+    target[path[-1]] = value
+
+    source = json.dumps(
+        {
+            "version": 1,
+            "minor_version": 1,
+            "key": store.key,
+            "data": payload,
+        }
+    )
+    store_path = Path(store._store.path)
+
+    def write_document() -> None:
+        store_path.parent.mkdir(parents=True, exist_ok=True)
+        store_path.write_text(source)
+
+    await hass.async_add_executor_job(write_document)
+    expected_message = "corrupt" if isinstance(value, float) and value != value else message
+    with pytest.raises(HistoryStoreError, match=expected_message):
+        await store.async_load()
+    assert await hass.async_add_executor_job(store_path.read_text) == source
+
+
+@pytest.mark.parametrize(
+    ("container", "field", "value", "message"),
+    [
+        ("summary", "total_energy_kcal", 2345.6, "v2 summary has invalid fields"),
+        ("expanded", "body_fat_percentage", 21.4, "v2 expanded has invalid fields"),
+    ],
+)
+async def test_schema_v2_rejects_parity_fields_without_rewriting_source(
+    hass,
+    store: HealthHistoryStore,
+    container: str,
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    """Schema-v2 cannot accept fields introduced by schema-v3 compatibility."""
+    payload = _v2_payload(summary_for("2042-07-13", expanded=_expanded_metrics()))
+    summaries = payload["summaries"]
+    assert isinstance(summaries, dict)
+    row = summaries["2042-07-13"]
+    assert isinstance(row, dict)
+    target = row
+    if container == "expanded":
+        expanded = row["expanded"]
+        assert isinstance(expanded, dict)
+        target = expanded
+    target[field] = value
+    source = json.dumps(
+        {
+            "version": 1,
+            "minor_version": 1,
+            "key": store.key,
+            "data": payload,
+        }
+    )
+    path = Path(store._store.path)
+
+    def write_document() -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source)
+
+    await hass.async_add_executor_job(write_document)
+
+    with pytest.raises(HistoryStoreError, match=message):
+        await store.async_load()
+    assert await hass.async_add_executor_job(path.read_text) == source
+
+
+async def test_v2_duplicate_expanded_json_key_and_unsupported_schema_do_not_rewrite_source(
+    hass,
+    store: HealthHistoryStore,
+) -> None:
+    """The direct reader leaves malformed or unsupported schema-v2 files untouched."""
+    summary = summary_for("2042-07-13", expanded=_expanded_metrics())
+    document = json.dumps(
+        {
+            "version": 1,
+            "minor_version": 1,
+            "key": store.key,
+            "data": _v2_payload(summary),
+        },
+        separators=(",", ":"),
+    )
+    duplicate = document.replace('"vo2_max":42.5', '"vo2_max":42.5,"vo2_max":42.5', 1)
+    unsupported = document.replace('"schema_version":2', '"schema_version":4', 1)
+    path = Path(store._store.path)
+
+    for source, message in ((duplicate, "duplicate"), (unsupported, "unsupported")):
+        def write_document() -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(source)
+
+        await hass.async_add_executor_job(write_document)
+        reader = HealthHistoryStore(hass, "entry-id")
+        with pytest.raises(HistoryStoreError, match=message):
+            await reader.async_load()
+        assert await hass.async_add_executor_job(path.read_text) == source
+
+
+async def test_upsert_replaces_one_date_without_disturbing_other_dates(
+    store: HealthHistoryStore,
+) -> None:
+    """Later normalization for a date replaces just that date's summary."""
+    await store.async_upsert(summary_for("2042-07-12", steps=5000))
+    await store.async_upsert(summary_for("2042-07-13", steps=6200))
+    await store.async_upsert(summary_for("2042-07-13", steps=6300))
+
+    rows = await store.async_query(date(2042, 7, 12), date(2042, 7, 13))
+
+    assert [row.steps for row in rows] == [5000, 6300]
+
+
+async def test_query_orders_dates_and_uses_inclusive_bounds(store: HealthHistoryStore) -> None:
+    """History queries are chronological and include both requested endpoints."""
+    await store.async_upsert(summary_for("2042-07-14", steps=7000))
+    await store.async_upsert(summary_for("2042-07-12", steps=5000))
+    await store.async_upsert(summary_for("2042-07-13", steps=6000))
+
+    rows = await store.async_query(date(2042, 7, 13), date(2042, 7, 14))
+
+    assert [(row.date, row.steps) for row in rows] == [
+        (date(2042, 7, 13), 6000),
+        (date(2042, 7, 14), 7000),
+    ]
+
+
+async def test_per_entry_history_is_isolated(hass) -> None:
+    """Each config entry writes and reads an independent history document."""
+    first = HealthHistoryStore(hass, "first-entry")
+    second = HealthHistoryStore(hass, "second-entry")
+
+    await first.async_upsert(summary_for("2042-07-12", steps=5000))
+    await second.async_upsert(summary_for("2042-07-12", steps=6000))
+    await first.async_set_backfill_checkpoint(date(2042, 7, 1))
+    await second.async_set_backfill_checkpoint(date(2042, 7, 2))
+
+    first_reloaded = HealthHistoryStore(hass, "first-entry")
+    second_reloaded = HealthHistoryStore(hass, "second-entry")
+    assert [row.steps for row in await first_reloaded.async_load()] == [5000]
+    assert [row.steps for row in await second_reloaded.async_load()] == [6000]
+    assert first_reloaded.backfill_cursor == date(2042, 7, 1)
+    assert second_reloaded.backfill_cursor == date(2042, 7, 2)
+
+
+async def test_round_trip_preserves_every_normalized_field_and_uses_exact_store_key(
+    hass,
+    store: HealthHistoryStore,
+) -> None:
+    """Only complete normalized summaries survive a durable Store round trip."""
+    summary = summary_for("2042-07-13")
+
+    assert store.key == "healthflow.entry-id.history"
+    await store.async_upsert(summary)
+    await store.async_set_backfill_checkpoint(date(2042, 7, 1))
+
+    reloaded = HealthHistoryStore(hass, "entry-id")
+    assert await reloaded.async_load() == [summary]
+    assert reloaded.backfill_cursor == date(2042, 7, 1)
+
+    raw = await Store[dict[str, object]](hass, 1, store.key).async_load()
+    assert raw is not None
+    assert raw["schema_version"] == 3
+    assert raw["body_measurements_enabled"] is False
+    assert raw["expanded_backfill_cursor"] is None
+    assert {"raw", "id", "token", "credential", "google"}.isdisjoint(_all_keys(raw))
+    summaries = raw["summaries"]
+    assert isinstance(summaries, dict)
+    persisted = summaries[summary.date.isoformat()]
+    assert isinstance(persisted, dict)
+    assert persisted["updated_at"] == summary.updated_at.isoformat()
+    workouts = persisted["workouts"]
+    assert isinstance(workouts, list)
+    assert workouts[0]["start"] == summary.workouts[0].start.isoformat()
+    assert workouts[0]["end"] == summary.workouts[0].end.isoformat()
+
+
+async def test_normal_updates_delay_save_and_checkpoint_is_durable(
+    store: HealthHistoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Frequent summary writes are batched while checkpoint writes are durable."""
+    delayed: list[tuple[object, float]] = []
+    saved: list[dict[str, object]] = []
+
+    def capture_delay(data_func, delay: float) -> None:
+        delayed.append((data_func(), delay))
+
+    async def capture_save(data: dict[str, object]) -> None:
+        saved.append(data)
+
+    monkeypatch.setattr(store._store, "async_delay_save", capture_delay)
+    monkeypatch.setattr(store._store, "async_save", capture_save)
+
+    await store.async_upsert(summary_for("2042-07-13"))
+    await store.async_set_backfill_checkpoint(date(2042, 7, 1))
+
+    assert delayed and delayed[0][1] == 1.0
+    assert saved == [delayed[0][0] | {"backfill_cursor": "2042-07-01"}]
+
+
+async def test_delayed_save_uses_the_upsert_snapshot(
+    store: HealthHistoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A delayed callback cannot serialize summaries added by later operations."""
+    delayed: list[tuple[object, float]] = []
+
+    def capture_delay(data_func, delay: float) -> None:
+        delayed.append((data_func, delay))
+
+    monkeypatch.setattr(store._store, "async_delay_save", capture_delay)
+
+    await store.async_upsert(summary_for("2042-07-12", steps=5000))
+    await store.async_upsert(summary_for("2042-07-13", steps=6000))
+
+    first_snapshot, first_delay = delayed[0]
+    assert first_delay == 1.0
+    assert callable(first_snapshot)
+    assert list(first_snapshot()["summaries"]) == ["2042-07-12"]
+
+
+async def test_invalid_store_payload_raises_without_replacing_original_content(
+    hass,
+    store: HealthHistoryStore,
+) -> None:
+    """Malformed persisted data remains intact for investigation or restoration."""
+    original = _payload(summary_for("2042-07-13"))
+    original["summaries"] = {
+        "2042-07-13": _summary_payload(summary_for("2042-07-13")) | {"steps": "not-an-integer"}
+    }
+    await Store[dict[str, object]](hass, 1, store.key).async_save(original)
+
+    with pytest.raises(HistoryStoreError, match="steps"):
+        await store.async_load()
+
+    assert await Store[dict[str, object]](hass, 1, store.key).async_load() == original
+
+
+async def test_corrupt_json_raises_without_renaming_or_resetting_history(
+    hass,
+    store: HealthHistoryStore,
+) -> None:
+    """Syntactically corrupt Store content remains intact for manual recovery."""
+    original = "{not-valid-json"
+    path = Path(store._store.path)
+
+    def write_corrupt_document() -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(original)
+
+    await hass.async_add_executor_job(write_corrupt_document)
+    try:
+        with pytest.raises(HistoryStoreError, match="corrupt"):
+            await store.async_load()
+
+        assert await hass.async_add_executor_job(path.read_text) == original
+        assert not list(path.parent.glob(f"{path.name}.corrupt.*"))
+    finally:
+        await hass.async_add_executor_job(path.unlink)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("distance_m", nan),
+        ("active_energy_kcal", inf),
+        ("source", "unrecognized"),
+        ("updated_at", "2042-07-13T01:15:30"),
+        ("workouts", [{"activity_type": "WALKING"}]),
+    ],
+)
+async def test_invalid_summary_shapes_are_rejected_on_load(
+    store: HealthHistoryStore,
+    field: str,
+    value: object,
+) -> None:
+    """Stored fields must remain valid normalized values, not loosely typed JSON."""
+    payload = _payload(summary_for("2042-07-13"))
+    summary = payload["summaries"]
+    assert isinstance(summary, dict)
+    row = summary["2042-07-13"]
+    assert isinstance(row, dict)
+    row[field] = value
+
+    with pytest.raises(HistoryStoreError):
+        await store.async_load_payload(payload)
+
+
+async def test_schema_v0_migration_preserves_complete_summary_and_is_idempotent(
+    store: HealthHistoryStore,
+) -> None:
+    """The sole legacy shape migrates deterministically into the v1 document."""
+    summary = summary_for("2042-07-12")
+    legacy_payload = {
+        "summaries": [_summary_payload(summary)],
+        "backfill_cursor": "2042-07-01",
+    }
+
+    migrated_rows = await store.async_load_payload(legacy_payload)
+    current_payload = _payload(summary, cursor="2042-07-01")
+    current_rows = await store.async_load_payload(current_payload)
+
+    assert migrated_rows == {summary.date: summary}
+    assert current_rows == migrated_rows
+
+
+async def test_home_assistant_store_v0_migration_rewrites_the_v1_document(hass) -> None:
+    """Outer Store version migration retains every normalized field and checkpoint."""
+    summary = summary_for("2042-07-12")
+    key = "healthflow.entry-id.history"
+    legacy_payload = {
+        "summaries": [_summary_payload(summary)],
+        "backfill_cursor": "2042-07-01",
+    }
+    await Store[dict[str, object]](hass, 0, key).async_save(legacy_payload)
+
+    store = HealthHistoryStore(hass, "entry-id")
+    assert await store.async_load() == [summary]
+    assert store.backfill_cursor == date(2042, 7, 1)
+
+    migrated = await Store[dict[str, object]](hass, 1, key).async_load()
+    assert migrated == _v3_payload(summary, cursor="2042-07-01")
+
+
+async def test_legacy_store_wrapper_without_minor_version_defaults_to_one(
+    hass,
+    store: HealthHistoryStore,
+) -> None:
+    """Home Assistant's historic missing minor_version remains readable as version one."""
+    summary = summary_for("2042-07-12")
+    path = Path(store._store.path)
+    legacy_wrapper = {
+        "version": 1,
+        "key": store.key,
+        "data": _payload(summary, cursor="2042-07-01"),
+    }
+
+    def write_legacy_wrapper() -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(legacy_wrapper))
+
+    await hass.async_add_executor_job(write_legacy_wrapper)
+    assert await store.async_load() == [summary]
+    assert store.backfill_cursor == date(2042, 7, 1)
+
+
+async def test_outer_v0_malformed_summary_never_rewrites_the_store(hass) -> None:
+    """Outer Store migration validates every nested field before HA auto-saves it."""
+    store = HealthHistoryStore(hass, "entry-id")
+    legacy = {
+        "summaries": [_summary_payload(summary_for("2042-07-12"))],
+        "backfill_cursor": "2042-07-01",
+    }
+    summaries = legacy["summaries"]
+    assert isinstance(summaries, list)
+    row = summaries[0]
+    assert isinstance(row, dict)
+    row["workouts"] = [{"activity_type": "WALKING"}]
+    await Store[dict[str, object]](hass, 0, store.key).async_save(legacy)
+    path = Path(store._store.path)
+    original = await hass.async_add_executor_job(path.read_bytes)
+
+    with pytest.raises(HistoryStoreError, match="workout"):
+        await store.async_load()
+
+    assert await hass.async_add_executor_job(path.read_bytes) == original
+
+
+async def test_inner_v0_migration_saves_once_and_clean_current_load_does_not_save(
+    hass,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only validated inner v0 data gets one durable current-schema rewrite."""
+    summary = summary_for("2042-07-12")
+    legacy = {
+        "summaries": [_summary_payload(summary)],
+        "backfill_cursor": "2042-07-01",
+    }
+    key = "healthflow.entry-id.history"
+    await Store[dict[str, object]](hass, 1, key).async_save(legacy)
+    store = HealthHistoryStore(hass, "entry-id")
+    saved: list[dict[str, object]] = []
+    original_save = store._store.async_save
+
+    async def capture_save(data: dict[str, object]) -> None:
+        saved.append(data)
+        await original_save(data)
+
+    monkeypatch.setattr(store._store, "async_save", capture_save)
+
+    assert await store.async_load() == [summary]
+    assert saved == [_v3_payload(summary, cursor="2042-07-01")]
+    assert await store.async_load() == [summary]
+    assert saved == [_v3_payload(summary, cursor="2042-07-01")]
+
+    clean = HealthHistoryStore(hass, "entry-id")
+    clean_saves: list[dict[str, object]] = []
+    clean_original_save = clean._store.async_save
+
+    async def capture_clean_save(data: dict[str, object]) -> None:
+        clean_saves.append(data)
+        await clean_original_save(data)
+
+    monkeypatch.setattr(clean._store, "async_save", capture_clean_save)
+    assert await clean.async_load() == [summary]
+    assert clean_saves == []
+
+
+async def test_failed_reload_latches_writes_until_an_explicit_successful_repair(
+    hass,
+    store: HealthHistoryStore,
+) -> None:
+    """A failed reload cannot let stale state overwrite corrupted history."""
+    await store.async_upsert(summary_for("2042-07-12", steps=5000))
+    await store.async_set_backfill_checkpoint(date(2042, 7, 1))
+    malformed = _payload(summary_for("2042-07-13"))
+    summaries = malformed["summaries"]
+    assert isinstance(summaries, dict)
+    row = summaries["2042-07-13"]
+    assert isinstance(row, dict)
+    row["steps"] = "bad"
+    await Store[dict[str, object]](hass, 1, store.key).async_save(malformed)
+
+    with pytest.raises(HistoryStoreError, match="steps"):
+        await store.async_load()
+    with pytest.raises(HistoryStoreError, match="failed load"):
+        await store.async_upsert(summary_for("2042-07-14", steps=7000))
+    with pytest.raises(HistoryStoreError, match="failed load"):
+        await store.async_set_backfill_checkpoint(date(2042, 7, 2))
+    assert await Store[dict[str, object]](hass, 1, store.key).async_load() == malformed
+
+    repaired = _payload(summary_for("2042-07-13", steps=6300), cursor="2042-07-02")
+    await Store[dict[str, object]](hass, 1, store.key).async_save(repaired)
+    store._store._data = None
+
+    assert await store.async_load() == [summary_for("2042-07-13", steps=6300)]
+    await store.async_upsert(summary_for("2042-07-14", steps=7000))
+    await store.async_set_backfill_checkpoint(date(2042, 7, 3))
+    assert store.backfill_cursor == date(2042, 7, 3)
+
+
+async def test_valid_reload_retains_pending_summaries_before_a_checkpoint_flush(
+    hass,
+    store: HealthHistoryStore,
+) -> None:
+    """A valid disk read cannot replace a loaded delayed-write snapshot with stale history."""
+    baseline = summary_for("2042-07-10", steps=4000)
+    pending_first = summary_for("2042-07-11", steps=5000)
+    pending_second = summary_for("2042-07-12", steps=6000)
+    await Store[dict[str, object]](hass, 1, store.key).async_save(
+        _payload(baseline, cursor="2042-07-01")
+    )
+
+    assert await store.async_load() == [baseline]
+    await store.async_upsert(pending_first)
+    assert await store.async_load() == [baseline, pending_first]
+    await store.async_upsert(pending_second)
+    await store.async_set_backfill_checkpoint(date(2042, 7, 2))
+
+    reloaded = HealthHistoryStore(hass, "entry-id")
+    assert await reloaded.async_load() == [baseline, pending_first, pending_second]
+    assert reloaded.backfill_cursor == date(2042, 7, 2)
+
+
+async def test_failed_reload_cancels_pending_delayed_and_final_writes(
+    hass,
+    store: HealthHistoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed reload cannot let a queued Store write replace corrupt history."""
+    path = Path(store._store.path)
+    corrupt = "{externally-corrupt-history"
+
+    async def write_to_disk(data: dict[str, object]) -> None:
+        if "data_func" in data:
+            data["data"] = data.pop("data_func")()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data))
+
+    monkeypatch.setattr(store._store, "_async_write_data", write_to_disk)
+    await store.async_upsert(summary_for("2042-07-12", steps=5000))
+
+    def corrupt_store() -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(corrupt)
+
+    await hass.async_add_executor_job(corrupt_store)
+    try:
+        with pytest.raises(HistoryStoreError, match="corrupt"):
+            await store.async_load()
+
+        store._store._async_schedule_callback_delayed_write()
+        await hass.async_block_till_done()
+        hass.bus.async_fire(EVENT_HOMEASSISTANT_FINAL_WRITE)
+        await hass.async_block_till_done()
+
+        assert await hass.async_add_executor_job(path.read_text) == corrupt
+        assert not list(path.parent.glob(f"{path.name}.corrupt.*"))
+    finally:
+        if path.exists():
+            await hass.async_add_executor_job(path.unlink)
+
+
+async def test_single_read_boundary_rejects_atomic_corrupt_replacement_without_store_load(
+    hass,
+    store: HealthHistoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The single-read boundary sees an atomic replacement without Store reset behavior."""
+    path = Path(store._store.path)
+    replacement = path.with_name(f"{path.name}.replacement")
+    initial = {
+        "version": 1,
+        "minor_version": 1,
+        "key": store.key,
+        "data": _payload(summary_for("2042-07-13")),
+    }
+    corrupt = "{atomically-replaced-corrupt-history"
+
+    def write_initial() -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(initial))
+        replacement.write_text(corrupt)
+
+    await hass.async_add_executor_job(write_initial)
+    original_reader = getattr(store._store, "_read_validated_store_document", None)
+    read_calls = 0
+
+    def replace_then_read() -> object:
+        nonlocal read_calls
+        read_calls += 1
+        os.replace(replacement, path)
+        assert original_reader is not None
+        return original_reader()
+
+    async def unexpected_store_load() -> None:
+        raise AssertionError("history load must not invoke Store.async_load")
+
+    monkeypatch.setattr(
+        store._store, "_read_validated_store_document", replace_then_read, raising=False
+    )
+    monkeypatch.setattr(store._store, "async_load", unexpected_store_load)
+    try:
+        with pytest.raises(HistoryStoreError, match="corrupt"):
+            await store.async_load()
+
+        assert read_calls == 1
+        assert await hass.async_add_executor_job(path.read_text) == corrupt
+        assert not list(path.parent.glob(f"{path.name}.corrupt.*"))
+    finally:
+        for candidate in (path, replacement):
+            if candidate.exists():
+                await hass.async_add_executor_job(candidate.unlink)
+
+
+async def test_concurrent_cold_start_upserts_share_one_load_and_preserve_both_dates(
+    store: HealthHistoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent first uses cannot race state replacement after their loads finish."""
+    first_load_started = asyncio.Event()
+    first_load_release = asyncio.Event()
+    second_load_release = asyncio.Event()
+    load_calls = 0
+
+    async def blocked_load() -> tuple[
+        dict[date, DailySummary], date | None, date | None, bool, None, bool
+    ]:
+        nonlocal load_calls
+        load_calls += 1
+        if load_calls == 1:
+            first_load_started.set()
+            await first_load_release.wait()
+        else:
+            await second_load_release.wait()
+        return {}, None, None, False, None, False
+
+    monkeypatch.setattr(store._store, "async_load_validated_history", blocked_load)
+    first = asyncio.create_task(store.async_upsert(summary_for("2042-07-12", steps=5000)))
+    await first_load_started.wait()
+    second = asyncio.create_task(store.async_upsert(summary_for("2042-07-13", steps=6000)))
+    await asyncio.sleep(0)
+    second_load_release.set()
+    first_load_release.set()
+    await asyncio.gather(first, second)
+
+    assert load_calls == 1
+    assert [row.steps for row in await store.async_query(date(2042, 7, 12), date(2042, 7, 13))] == [
+        5000,
+        6000,
+    ]
+
+
+async def test_concurrent_cold_upsert_and_checkpoint_preserve_both_values(
+    store: HealthHistoryStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpointing cannot race an upsert's first-load state replacement."""
+    first_load_started = asyncio.Event()
+    first_load_release = asyncio.Event()
+    second_load_release = asyncio.Event()
+    load_calls = 0
+
+    async def blocked_load() -> tuple[
+        dict[date, DailySummary], date | None, date | None, bool, None, bool
+    ]:
+        nonlocal load_calls
+        load_calls += 1
+        if load_calls == 1:
+            first_load_started.set()
+            await first_load_release.wait()
+        else:
+            await second_load_release.wait()
+        return {}, None, None, False, None, False
+
+    monkeypatch.setattr(store._store, "async_load_validated_history", blocked_load)
+    upsert = asyncio.create_task(store.async_upsert(summary_for("2042-07-13", steps=6000)))
+    await first_load_started.wait()
+    checkpoint = asyncio.create_task(store.async_set_backfill_checkpoint(date(2042, 7, 1)))
+    await asyncio.sleep(0)
+    second_load_release.set()
+    first_load_release.set()
+    await asyncio.gather(upsert, checkpoint)
+
+    assert load_calls == 1
+    assert store.backfill_cursor == date(2042, 7, 1)
+    assert [row.steps for row in await store.async_query(date(2042, 7, 13), date(2042, 7, 13))] == [
+        6000
+    ]
+
+
+@pytest.mark.parametrize(
+    "timestamp",
+    [
+        "2042-07-13T01:15:30.123456Z",
+        "2042-07-13 01:15:30.123456+00:00",
+        "2042-07-13T01:15:30.123456",
+        "2042-07-13T01:15:30.123456+0000",
+    ],
+)
+async def test_timestamp_strings_must_match_canonical_isoformat_output(
+    store: HealthHistoryStore,
+    timestamp: str,
+) -> None:
+    """Accepted timestamps have exactly the serialized datetime.isoformat form."""
+    payload = _payload(summary_for("2042-07-13"))
+    summaries = payload["summaries"]
+    assert isinstance(summaries, dict)
+    row = summaries["2042-07-13"]
+    assert isinstance(row, dict)
+    row["updated_at"] = timestamp
+
+    with pytest.raises(HistoryStoreError):
+        await store.async_load_payload(payload)
+
+
+@pytest.mark.parametrize("duplicate_kind", ["outer", "document", "summary", "workout"])
+async def test_duplicate_json_keys_fail_closed_and_latch_writes(
+    hass,
+    store: HealthHistoryStore,
+    duplicate_kind: str,
+) -> None:
+    """Preflight rejects duplicate keys before Home Assistant can collapse them."""
+    original = _duplicate_key_store_json(summary_for("2042-07-13"), store.key, duplicate_kind)
+    path = Path(store._store.path)
+
+    def write_document() -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(original)
+
+    await hass.async_add_executor_job(write_document)
+    try:
+        with pytest.raises(HistoryStoreError, match="duplicate"):
+            await store.async_load()
+        with pytest.raises(HistoryStoreError, match="failed load"):
+            await store.async_upsert(summary_for("2042-07-14", steps=7000))
+
+        assert await hass.async_add_executor_job(path.read_text) == original
+    finally:
+        await hass.async_add_executor_job(path.unlink)
+
+
+@pytest.mark.parametrize("invalid_cursor", ["2042-07", "2042-07-01T00:00:00+00:00", 1])
+async def test_invalid_backfill_cursor_is_rejected(
+    store: HealthHistoryStore,
+    invalid_cursor: object,
+) -> None:
+    """A checkpoint is always a single ISO local date or absent."""
+    with pytest.raises(HistoryStoreError, match="backfill_cursor"):
+        await store.async_load_payload(_payload(summary_for("2042-07-13"), cursor=invalid_cursor))
+
+
+async def test_query_rejects_invalid_or_reversed_date_bounds(store: HealthHistoryStore) -> None:
+    """Date-bound semantics cannot silently broaden a dashboard query."""
+    with pytest.raises(ValueError, match="start"):
+        await store.async_query(date(2042, 7, 14), date(2042, 7, 13))
+    with pytest.raises(TypeError, match="date"):
+        await store.async_query(datetime(2042, 7, 13, tzinfo=UTC), date(2042, 7, 14))
+
+
+def _all_keys(value: object) -> set[str]:
+    if isinstance(value, Mapping):
+        return set(value) | set().union(*(_all_keys(item) for item in value.values()))
+    if isinstance(value, list):
+        return set().union(*(_all_keys(item) for item in value))
+    return set()
+
+
+def _duplicate_key_store_json(summary: DailySummary, key: str, kind: str) -> str:
+    summary_payload = _summary_payload(summary)
+    summary_json = json.dumps(summary_payload, separators=(",", ":"))
+    if kind == "outer":
+        document_json = _document_json(summary.date.isoformat(), summary_json)
+        return (
+            '{"version":1,"version":1,"minor_version":1,"key":'
+            f'{json.dumps(key)},"data":{document_json}}}'
+        )
+    if kind == "document":
+        document_json = (
+            '{"schema_version":1,"schema_version":1,"summaries":'
+            f'{{{json.dumps(summary.date.isoformat())}:{summary_json}}},"backfill_cursor":null}}'
+        )
+    elif kind == "summary":
+        document_json = (
+            '{"schema_version":1,"summaries":'
+            f"{{{json.dumps(summary.date.isoformat())}:{summary_json},"
+            f'{json.dumps(summary.date.isoformat())}:{summary_json}}},"backfill_cursor":null}}'
+        )
+    elif kind == "workout":
+        workout_json = json.dumps(summary_payload["workouts"][0], separators=(",", ":"))
+        duplicated_workout_json = workout_json.replace(
+            '"activity_type":"WALKING"',
+            '"activity_type":"WALKING","activity_type":"RUNNING"',
+            1,
+        )
+        document_json = _document_json(
+            summary.date.isoformat(), summary_json.replace(workout_json, duplicated_workout_json, 1)
+        )
+    else:
+        raise AssertionError(f"unexpected duplicate kind: {kind}")
+    return f'{{"version":1,"minor_version":1,"key":{json.dumps(key)},"data":{document_json}}}'
+
+
+def _document_json(serialized_day: str, summary_json: str) -> str:
+    return (
+        '{"schema_version":1,"summaries":'
+        f'{{{json.dumps(serialized_day)}:{summary_json}}},"backfill_cursor":null}}'
+    )
